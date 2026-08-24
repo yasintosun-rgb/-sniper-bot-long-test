@@ -91,7 +91,12 @@ AYARLAR = {
     'MAX_GUNLUK_ZARAR':        float(os.environ.get('MAX_GUNLUK_ZARAR', 5.0)),
     'DRAWDOWN_LIMIT':          float(os.environ.get('DRAWDOWN_LIMIT', 10.0)),
     'KOMISYON_ORAN':           float(os.environ.get('KOMISYON_ORAN', 0.0005)),
-    'EMA200_ALTI_MIN_MUM':     int(os.environ.get('EMA200_ALTI_MIN_MUM', 72)),     # backtest'te doğrulanmış (3 gün)
+    # ⚠️ GEÇİCİ TEST DEĞERİ (2026-08-23): mekanizma testini (giriş+SL+
+    # trailing) hızlandırmak için 72 yerine 2 — bu, DOĞRULANMIŞ strateji
+    # değeri DEĞİL, backtest'te 72 (3 gün) kullanıldı ve doğrulandı.
+    # CANLIYA ALMADAN ÖNCE MUTLAKA 72'YE GERİ DÖNDÜRÜN (ya da bu satırı
+    # 'int(os.environ.get(...(...), 72))' haline getirin).
+    'EMA200_ALTI_MIN_MUM':     int(os.environ.get('EMA200_ALTI_MIN_MUM', 2)),     # ⚠️ TEST DEĞERİ — GERÇEK: 72
     'PERCENT_TRAILING_MESAFE': float(os.environ.get('PERCENT_TRAILING_MESAFE', 7.0)),  # backtest'te doğrulanmış
     'COOLDOWN_SURE':           int(os.environ.get('COOLDOWN_SURE', 3600)),
     'SEMBOL_GUNLUK_MAX_KAYIP': int(os.environ.get('SEMBOL_GUNLUK_MAX_KAYIP', 2)),
@@ -102,12 +107,43 @@ INTERVAL = '1h'   # backtest'te doğrulanmış zaman dilimi — SHORT bot'un 15d
 WARMUP_MUM = 250  # EMA200 ısınması için ekstra geçmiş mum
 
 # 20 coin evreni — backtest_ema_htf.py ile AYNI (doğrulama bu evrende yapıldı)
-SYMBOLS = [
+# DENEY (2026-08-23, kullanıcı isteği): TESTNET'te mekanizma doğrulamasını
+# HIZLANDIRMAK için sabit 20-coin listesi yerine DİNAMİK, hacme göre
+# genişletilmiş bir evren kullanılıyor — bot.py'deki (SHORT)
+# en_yuksek_hacimli_coinler() ile AYNI mantık/aynı EXCLUDE listesi.
+# ÖNEMLİ: Bu SADECE testnet/mekanizma testi içindir — backtest_ema_htf.py'de
+# doğrulanan strateji SADECE 20-coin evreninde test edildi. GERÇEK PARAYA
+# geçerken SYMBOLS'u tekrar doğrulanmış 20-coin sabit listesine (aşağıda
+# ORIJINAL_20_SYMBOLS olarak saklandı) döndürün — daha geniş evren
+# stratejinin edge'inin geçerli olduğu kanıtlanmamış coinleri de içerir.
+ORIJINAL_20_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
     "ADAUSDT", "DOGEUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT",
     "DOTUSDT", "MATICUSDT", "TRXUSDT", "ATOMUSDT", "NEARUSDT",
     "APTUSDT", "ARBUSDT", "OPUSDT", "SUIUSDT", "INJUSDT",
 ]
+
+DINAMIK_COIN_EVRENI = True   # False yaparsanız ORIJINAL_20_SYMBOLS sabit listesi kullanılır
+DUSUK_HACIM_USD_LONG = 30_000_000   # bot.py ile aynı eşik
+
+# bot.py'deki EXCLUDE listesiyle AYNI — TradFi tokenize hisse/stabilcoin/
+# bilinen sorunlu semboller (canlı SHORT tecrübesinden).
+EXCLUDE_LONG = {
+    'USDTUSDT','BUSDUSDT','USDCUSDT','TUSDUSDT','FDUSDUSDT',
+    'BTCDOMUSDT','DEFIUSDT','BNBUSDT','SPCXUSDT','XAUUSDT','XAGUSDT',
+    'MSTRUSDT','SKHYNIXUSDT','SNDKUSDT','SOXLUSDT','MUUSDT','KORUUSDT',
+    'LABUSDT','CLUSDT','SKLUSDT','EVAAUSDT','CRCLUSDT','DRAMUSDT',
+    'VELVETUSDT','DEXEUSDT','BZUSDT','TACUSDT','EWYUSDT','TAGUSDT',
+    'USUSDT','SAMSUNGUSDT','SKHYUSDT','XPINUSDT','BUSDT',
+    'MMTUSDT','ARBUSDT','VANRYUSDT',
+    'QQQUSDT','NVDAUSDT','INTCUSDT','BILLUSDT','MRVLUSDT','ALLOUSDT',
+    'GOOGLUSDT','TSLAUSDT','AMDUSDT','SOXSUSDT','AAPLUSDT','SPYUSDT','MSFTUSDT','METAUSDT','AMZNUSDT','ARMUSDT',
+    'COINUSDT','HOODUSDT','GSUSDT','PYPLUSDT','DELLUSDT','AMATUSDT','IBMUSDT','NOKUSDT','SMHUSDT','BEUSDT',
+    'AAOIUSDT','COHRUSDT',
+}
+ZAYIF_PERFORMANS_SEMBOLLER_LONG = {'IDOLUSDT', 'KAITOUSDT', 'HYPEUSDT'}
+
+SYMBOLS = list(ORIJINAL_20_SYMBOLS)  # dinamik mod açıksa tarama_dongusu her döngüde bunu günceller
 
 TARAMA_ARALIK = 300   # ana döngü aralığı (saniye) — 1sa stratejisi için 15dk'lık bot kadar sık taramaya gerek yok
 
@@ -838,6 +874,30 @@ def pozisyonlar_al():
 # STRATEJİ — "EMA200 DÖNÜŞÜ"
 # ════════════════════════════════════════════════════════════════════════════════
 
+def en_yuksek_hacimli_coinler_long():
+    """bot.py'deki en_yuksek_hacimli_coinler() ile AYNI mantık — TESTNET
+    mekanizma testini hızlandırmak için MAX_COIN yerine sabit, oldukça
+    geniş bir üst sınır (80) kullanıyor. DUSUK_HACIM_USD_LONG altındaki
+    ve EXCLUDE_LONG/ZAYIF_PERFORMANS_SEMBOLLER_LONG'daki semboller elenir."""
+    try:
+        coins = []
+        for t in client.futures_ticker():
+            sym = t['symbol']
+            if not sym.endswith('USDT') or sym in EXCLUDE_LONG or sym in ZAYIF_PERFORMANS_SEMBOLLER_LONG:
+                continue
+            h = float(t['quoteVolume'])
+            if h < DUSUK_HACIM_USD_LONG:
+                continue
+            coins.append({'symbol': sym, 'hacim': h})
+        coins.sort(key=lambda x: x['hacim'], reverse=True)
+        sonuc = [c['symbol'] for c in coins[:80]]
+        log.info(f"Dinamik coin evreni güncellendi: {len(sonuc)} sembol")
+        return sonuc
+    except Exception as e:
+        log.error(f"Dinamik coin evreni hatasi: {e}")
+        return list(ORIJINAL_20_SYMBOLS)  # hata olursa güvenli/bilinen listeye düş
+
+
 def strateji_kontrol(symbol):
     """
     Giriş: fiyat en az EMA200_ALTI_MIN_MUM ardışık 1sa mum boyunca EMA200
@@ -886,14 +946,22 @@ def strateji_kontrol(symbol):
 # ════════════════════════════════════════════════════════════════════════════════
 
 def tarama_dongusu():
-    global gunluk_islem, gunluk_zarar, gunluk_net_kz, son_gun, baslangic_bakiye
+    global gunluk_islem, gunluk_zarar, gunluk_net_kz, son_gun, baslangic_bakiye, SYMBOLS
     son_gun = datetime.now().date(); baslangic_bakiye = bakiye()
     journal_baslik_yaz(); perf_baslangic_yukle()
     log.info("LONG bot tarama dongusu basladi, 60 saniye bekleniyor...")
     time.sleep(60)
+    _test_uyarisi = ""
+    if AYARLAR['EMA200_ALTI_MIN_MUM'] != 72:
+        _test_uyarisi = (f"\n\n⚠️⚠️⚠️ TEST MODU AKTİF ⚠️⚠️⚠️\n"
+                         f"EMA200_ALTI_MIN_MUM={AYARLAR['EMA200_ALTI_MIN_MUM']} — DOĞRULANMIŞ DEĞER DEĞİL (gerçek: 72)!\n"
+                         f"Bu SADECE mekanizma testi içindir — sonuçlar strateji kalitesini YANSITMAZ.\n"
+                         f"CANLIYA ALMADAN ÖNCE bu değeri 72'ye geri döndürün!")
+        log.warning(f"TEST MODU: EMA200_ALTI_MIN_MUM={AYARLAR['EMA200_ALTI_MIN_MUM']} (doğrulanmış değer: 72) — CANLIYA ALMADAN ÖNCE DÜZELTİN!")
     tg(f"🤖 LONG BOT BAŞLADI\nBakiye:{bakiye()} USDT Kaldıraç:{AYARLAR['LEVERAGE']}x\n"
        f"Risk:%{AYARLAR['RISK_PERCENT']} Trailing:%{AYARLAR['PERCENT_TRAILING_MESAFE']}\n"
-       f"Strateji: EMA200 dönüşü ({AYARLAR['EMA200_ALTI_MIN_MUM']} saat) — 1sa zaman dilimi")
+       f"Strateji: EMA200 dönüşü ({AYARLAR['EMA200_ALTI_MIN_MUM']} saat) — 1sa zaman dilimi"
+       f"{_test_uyarisi}")
     while True:
         try:
             bugun = datetime.now().date()
@@ -914,9 +982,15 @@ def tarama_dongusu():
             pozisyonlar = pozisyonlar_al()
             trailing_guncelle(pozisyonlar)
 
-            for sym in SYMBOLS:
+            if DINAMIK_COIN_EVRENI:
+                SYMBOLS = en_yuksek_hacimli_coinler_long()
+
+            log.info("═══ TARAMA DÖNGÜSÜ BAŞLIYOR (LONG) ═══")
+            for i, sym in enumerate(SYMBOLS):
+                log.info(f"  [{i+1}/{len(SYMBOLS)}] {sym} kontrol ediliyor...")
                 strateji_kontrol(sym)
                 time.sleep(0.3)
+            log.info(f"Tüm coinler için strateji kontrolü tamamlandı, {TARAMA_ARALIK}sn uyuyacak...")
 
             time.sleep(TARAMA_ARALIK)
         except Exception as e:
