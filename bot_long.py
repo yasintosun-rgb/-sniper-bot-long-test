@@ -930,7 +930,11 @@ def strateji_kontrol(symbol):
             j -= 1
 
         if ardisik_altinda < AYARLAR['EMA200_ALTI_MIN_MUM']:
-            log.debug(f"{symbol}: donus var ama sadece {ardisik_altinda} mum EMA200 altindaydi "
+            # DENEY (2026-08-24, teşhis amaçlı): geçici olarak INFO seviyesine
+            # çekildi ki hangi coinlerin "az kaldı"/"hiç yok" durumunda olduğu
+            # Render log'larında görünsün. Mekanizma testi bitince tekrar
+            # log.debug'a döndürülebilir (gürültüyü azaltmak için).
+            log.info(f"{symbol}: donus var ama sadece {ardisik_altinda} mum EMA200 altindaydi "
                       f"(gerekli: {AYARLAR['EMA200_ALTI_MIN_MUM']})")
             return
 
