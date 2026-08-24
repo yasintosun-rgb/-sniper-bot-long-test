@@ -1025,6 +1025,24 @@ def telegram_komut():
             tg(f"📊 LONG DURUM {'🔴 DURDURULDU' if bot_durduruldu else '🟢 AKTİF'}\n"
                f"Bakiye:{round(bakiye(),2)} USDT\nAçık:{acik_say} Günlük:{gunluk}/{AYARLAR['MAX_GUNLUK_ISLEM']}\n"
                f"Günlük NET K/Z:{round(gunluk_net_kz,2)} USDT")
+        elif cmd.startswith('/test_giris'):
+            # ⚠️ SADECE MEKANİZMA TESTİ İÇİNDİR — strateji giriş mantığını
+            # (ema200_donus) TAMAMEN BY-PASS EDER, doğrudan buy() çağırır.
+            # Amaç: piyasa şartları uygun sinyal üretmese bile emir+SL+
+            # trailing akışının doğru çalıştığını görebilmek. GERÇEK PARAYLA
+            # KULLANMAYIN — sadece TESTNET'te, bilinçli olarak kullanılmalı.
+            parcalar = metin.strip().split()
+            if len(parcalar) != 2:
+                tg("Kullanım: /test_giris SEMBOL  (örn: /test_giris BTCUSDT)")
+            else:
+                test_sembol = parcalar[1].upper()
+                try:
+                    test_fiyat = float(client.futures_symbol_ticker(symbol=test_sembol)['price'])
+                    tg(f"🧪 TEST GİRİŞİ tetikleniyor: {test_sembol}@{test_fiyat}\n"
+                       f"(Strateji sinyali DEĞİL — manuel mekanizma testi)")
+                    buy(test_sembol, test_fiyat)
+                except Exception as e:
+                    tg(f"❌ Test girişi başarısız {test_sembol}: {e}")
         elif cmd == '/bakiye':
             tg(f"💰 Bakiye: {round(bakiye(),2)} USDT")
         elif cmd == '/acik':
