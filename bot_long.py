@@ -1025,6 +1025,7 @@ def telegram_komut():
                 acik_say = len(acik); gunluk = gunluk_islem
             tg(f"📊 LONG DURUM {'🔴 DURDURULDU' if bot_durduruldu else '🟢 AKTİF'}\n"
                f"Bakiye:{round(bakiye(),2)} USDT\nAçık:{acik_say} Günlük:{gunluk}/{AYARLAR['MAX_GUNLUK_ISLEM']}\n"
+               f"Risk:%{AYARLAR['RISK_PERCENT']} Trailing:%{AYARLAR['PERCENT_TRAILING_MESAFE']} MaxOpen:{AYARLAR['MAX_OPEN_TRADES']}\n"
                f"Günlük NET K/Z:{round(gunluk_net_kz,2)} USDT")
         elif cmd == '/bakiye':
             tg(f"💰 Bakiye: {round(bakiye(),2)} USDT")
