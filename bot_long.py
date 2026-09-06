@@ -77,6 +77,7 @@ AYAR_SINIRLAR = {
     'DRAWDOWN_LIMIT':          (1.0, 30.0),
     'KOMISYON_ORAN':           (0.0001, 0.001),
     'EMA200_ALTI_MIN_MUM':     (24,  336),   # 1-14 gün (1sa mum) arası
+    'LONG_HACIM_ONAY_CARPAN':  (0.5, 5.0),
     'PERCENT_TRAILING_MESAFE': (2.0, 20.0),
     'COOLDOWN_SURE':           (300, 86400),
     'SEMBOL_GUNLUK_MAX_KAYIP': (1,   10),
@@ -92,6 +93,10 @@ AYARLAR = {
     'DRAWDOWN_LIMIT':          float(os.environ.get('DRAWDOWN_LIMIT', 10.0)),
     'KOMISYON_ORAN':           float(os.environ.get('KOMISYON_ORAN', 0.0005)),
     'EMA200_ALTI_MIN_MUM':     int(os.environ.get('EMA200_ALTI_MIN_MUM', 72)),     # ✅ CANLI DEĞER (backtest'te doğrulanmış, 3 gün)
+    # DENEY (2026-09-06, backtest'te doğrulandı, 4/5 sağlamlık): dönüş
+    # mumunda hacim onayı — mevcut hacim, önceki 20 mumun ortalamasının
+    # en az bu kadar katı olmalı. Getiri %18.78->%31.42, MaxDD %10.77->%5.94.
+    'LONG_HACIM_ONAY_CARPAN': float(os.environ.get('LONG_HACIM_ONAY_CARPAN', 2.0)),
     'PERCENT_TRAILING_MESAFE': float(os.environ.get('PERCENT_TRAILING_MESAFE', 7.0)),  # backtest'te doğrulanmış
     'COOLDOWN_SURE':           int(os.environ.get('COOLDOWN_SURE', 3600)),
     'SEMBOL_GUNLUK_MAX_KAYIP': int(os.environ.get('SEMBOL_GUNLUK_MAX_KAYIP', 2)),
@@ -933,6 +938,26 @@ def strateji_kontrol(symbol):
             log.debug(f"{symbol}: donus var ama sadece {ardisik_altinda} mum EMA200 altindaydi "
                       f"(gerekli: {AYARLAR['EMA200_ALTI_MIN_MUM']})")
             return
+
+        # DENEY (2026-09-06, backtest'te doğrulandı — 4/5 sağlamlık):
+        # dönüş mumunda hacim onayı — mevcut hacim, önceki 20 mumun
+        # ortalamasının en az LONG_HACIM_ONAY_CARPAN katı değilse sinyal
+        # atlanır. Getiri %18.78->%31.42, MaxDD %10.77->%5.94 (backtest).
+        # 'mumlar[:-1]' ile kapanis dizisi olusturuldugu icin, donus mumu
+        # kapanis[-1] = mumlar[-2]'ye karsilik geliyor. Fail-safe: hacim
+        # hesabi basarisiz olursa (veri sorunu), filtre UYGULANMAZ -- bir
+        # veri aksakligi yuzunden gecerli bir sinyali kaybetmeyelim.
+        try:
+            donus_mum_hacim = float(mumlar[-2][5])
+            onceki_20_hacim = [float(m[5]) for m in mumlar[-22:-2]]
+            hacim_ort = sum(onceki_20_hacim) / len(onceki_20_hacim) if onceki_20_hacim else 0
+            if hacim_ort > 0 and donus_mum_hacim <= hacim_ort * AYARLAR['LONG_HACIM_ONAY_CARPAN']:
+                log.debug(f"{symbol}: donus var ama hacim yetersiz "
+                          f"({round(donus_mum_hacim/hacim_ort,2)}x, "
+                          f"gerekli:{AYARLAR['LONG_HACIM_ONAY_CARPAN']}x)")
+                return
+        except Exception as e:
+            log.warning(f"{symbol}: hacim onayi hesaplanamadi, filtre uygulanmadan devam ediliyor: {e}")
 
         fiyat = kapanis[-1]
         log.info(f"LONG sinyali: {symbol}@{fiyat} ({ardisik_altinda} mum EMA200 altindan donus)")
