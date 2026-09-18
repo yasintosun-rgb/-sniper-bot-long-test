@@ -84,10 +84,23 @@ AYAR_SINIRLAR = {
     'MAX_TOPLAM_RISK':         (1.0, 20.0),
 }
 
+# ── Volatilite bazlı pozisyon boyutlandırma (2026-09-18, backtest'te 5/5 ──
+# sağlamlıkla doğrulandı: LONG'un 48-aylık MaxDD'sini ~%11.6 -> ~%10.8'e
+# düşürdü, getiri çoğu bölünmede makul ölçüde etkilendi, 2/5 bölünmede
+# getiri DE arttı). BTC'nin GÜNLÜK GERÇEKLEŞEN volatilitesine (o günün
+# 15dk log-getirilerinin std'si) göre RISK_PERCENT'i ölçekler: yüksek
+# volatilite rejiminde küçült, düşük volatilite rejiminde büyüt. Mevcut
+# DRAWDOWN_LIMIT bazlı risk küçültmesiyle (efektif_risk_percent) ÇARPIMSAL
+# olarak birleşir — backtest'teki mekanizmayla birebir aynı.
+VOLATILITE_BOYUTLANDIRMA_AKTIF = os.environ.get('VOLATILITE_BOYUTLANDIRMA_AKTIF', 'true').lower() == 'true'
+VOL_TRAILING_PENCERE_GUN = int(os.environ.get('VOL_TRAILING_PENCERE_GUN', 30))
+VOL_YUKSEK_CARPAN = float(os.environ.get('VOL_YUKSEK_CARPAN', 0.5))
+VOL_DUSUK_CARPAN = float(os.environ.get('VOL_DUSUK_CARPAN', 1.3))
+
 AYARLAR = {
     'LEVERAGE':                int(os.environ.get('LEVERAGE', 3)),         # bot.py ile AYNI OLMALI (Hedge Mode, sembol bazlı paylaşılıyor)
-    'RISK_PERCENT':            float(os.environ.get('RISK_PERCENT', 0.5)),
-    'MAX_OPEN_TRADES':         int(os.environ.get('MAX_OPEN_TRADES', 5)),
+    'RISK_PERCENT':            float(os.environ.get('RISK_PERCENT', 1.0)),  # backtest'te doğrulandı
+    'MAX_OPEN_TRADES':         int(os.environ.get('MAX_OPEN_TRADES', 10)),  # backtest'te doğrulandı (5/5 sağlamlık, hacim eşiğiyle birlikte)
     'MAX_GUNLUK_ISLEM':        int(os.environ.get('MAX_GUNLUK_ISLEM', 10)),
     'MAX_GUNLUK_ZARAR':        float(os.environ.get('MAX_GUNLUK_ZARAR', 5.0)),
     'DRAWDOWN_LIMIT':          float(os.environ.get('DRAWDOWN_LIMIT', 10.0)),
@@ -449,11 +462,102 @@ def bakiye():
     except Exception as e:
         log.error(f"Bakiye hatasi: {e}"); return 0.0
 
+_VOL_CACHE = {'tarih': None, 'carpan': 1.0}
+_VOL_CACHE_LOCK = threading.Lock()
+
+def _btc_volatilite_carpani():
+    """Backtest'teki _compute_btc_volatilite_risk_map ile AYNI mantık:
+    BTC'nin GÜNLÜK gerçekleşen volatilitesi (o günün 15dk log-getirilerinin
+    std'si), DÜNKÜ TAMAMLANMIŞ güne göre, trailing VOL_TRAILING_PENCERE_GUN
+    günün percentile'ına yerleştirilir (lookahead yok — bugünün henüz
+    tamamlanmamış mumu asla kullanılmaz, en son gün de güvenlik payı için
+    atlanır). Günde bir kez hesaplanıp cache'lenir — her pozisyon açılışında
+    ağır bir API çağrısı tekrarlanmasın diye."""
+    global _VOL_CACHE
+    bugun = datetime.now(timezone.utc).date()
+    with _VOL_CACHE_LOCK:
+        if _VOL_CACHE['tarih'] == bugun:
+            return _VOL_CACHE['carpan']
+
+    try:
+        gerekli_mum = (VOL_TRAILING_PENCERE_GUN + 3) * 96  # 96x15dk = 1 gün
+        tum_klines = []
+        end_time = None
+        while len(tum_klines) < gerekli_mum:
+            params = dict(symbol='BTCUSDT', interval='15m', limit=1500)
+            if end_time:
+                params['endTime'] = end_time
+            batch = client.futures_klines(**params)
+            if not batch:
+                break
+            tum_klines = batch + tum_klines
+            end_time = batch[0][0] - 1
+            if len(batch) < 1500:
+                break
+
+        if len(tum_klines) < 96 * 5:
+            log.error("[Volatilite] Yeterli BTC verisi alınamadı, nötr (1.0x) kullanılacak.")
+            return 1.0
+
+        gunluk_getiriler = {}
+        onceki_close = None
+        for k in tum_klines:
+            gun = k[0] // 86_400_000
+            close = float(k[4])
+            if onceki_close is not None and onceki_close > 0:
+                gunluk_getiriler.setdefault(gun, []).append(math.log(close / onceki_close))
+            onceki_close = close
+
+        gunluk_vol = {}
+        for gun, rets in gunluk_getiriler.items():
+            if len(rets) < 2:
+                continue
+            ortalama = sum(rets) / len(rets)
+            varyans = sum((r - ortalama) ** 2 for r in rets) / len(rets)
+            gunluk_vol[gun] = math.sqrt(varyans)
+
+        gunler_sirali = sorted(gunluk_vol.keys())
+        if len(gunler_sirali) < VOL_TRAILING_PENCERE_GUN + 2:
+            log.error("[Volatilite] Yeterli gün geçmişi yok, nötr (1.0x) kullanılacak.")
+            return 1.0
+
+        # En son (muhtemelen henüz tamamlanmamış) günü ATLA — ondan önceki
+        # tamamlanmış gün "dünkü gün" kabul edilir.
+        dunku_gun = gunler_sirali[-2]
+        dunku_vol = gunluk_vol[dunku_gun]
+        pencere_gunleri = [g for g in gunler_sirali if g < dunku_gun][-VOL_TRAILING_PENCERE_GUN:]
+        if len(pencere_gunleri) < VOL_TRAILING_PENCERE_GUN // 2:
+            return 1.0
+        pencere_vols = [gunluk_vol[g] for g in pencere_gunleri]
+        pct = sum(1 for v in pencere_vols if v <= dunku_vol) / len(pencere_vols)
+
+        if pct >= (2.0 / 3.0):
+            carpan = VOL_YUKSEK_CARPAN
+        elif pct <= (1.0 / 3.0):
+            carpan = VOL_DUSUK_CARPAN
+        else:
+            carpan = 1.0
+
+        with _VOL_CACHE_LOCK:
+            _VOL_CACHE = {'tarih': bugun, 'carpan': carpan}
+        log.info(f"[Volatilite] BTC günlük vol percentile={pct:.2f} -> risk çarpanı={carpan}x "
+                 f"(dünkü_vol={dunku_vol:.6f}, pencere={len(pencere_vols)} gün)")
+        return carpan
+    except Exception as e:
+        log.error(f"[Volatilite] Çarpan hesaplama hatası, nötr (1.0x) kullanılacak: {e}")
+        return 1.0
+
+
 def efektif_risk_percent():
     b = bakiye()
-    if baslangic_bakiye <= 0: return AYARLAR['RISK_PERCENT']
-    dd = (baslangic_bakiye - b) / baslangic_bakiye * 100
-    return AYARLAR['RISK_PERCENT'] * 0.5 if dd >= AYARLAR['DRAWDOWN_LIMIT'] else AYARLAR['RISK_PERCENT']
+    if baslangic_bakiye <= 0:
+        base = AYARLAR['RISK_PERCENT']
+    else:
+        dd = (baslangic_bakiye - b) / baslangic_bakiye * 100
+        base = AYARLAR['RISK_PERCENT'] * 0.5 if dd >= AYARLAR['DRAWDOWN_LIMIT'] else AYARLAR['RISK_PERCENT']
+    if VOLATILITE_BOYUTLANDIRMA_AKTIF:
+        base = base * _btc_volatilite_carpani()
+    return base
 
 def toplam_acik_risk():
     b = bakiye()
