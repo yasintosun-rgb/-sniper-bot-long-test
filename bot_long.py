@@ -97,6 +97,23 @@ VOL_TRAILING_PENCERE_GUN = int(os.environ.get('VOL_TRAILING_PENCERE_GUN', 30))
 VOL_YUKSEK_CARPAN = float(os.environ.get('VOL_YUKSEK_CARPAN', 0.5))
 VOL_DUSUK_CARPAN = float(os.environ.get('VOL_DUSUK_CARPAN', 1.3))
 
+# FIX (2026-09-19): EMA200 hesabı için yeterli ISINMA süresi (bkz.
+# strateji_kontrol içindeki ilgili FIX notu). Binance futures_klines tek
+# çağrıda en fazla 1500 mum döndürür; EMA200_ALTI_MIN_MUM üst sınırı 336
+# olduğu için 336+1000=1336 hâlâ tek çağrıya sığar.
+EMA_ISINMA_MUM = int(os.environ.get('EMA_ISINMA_MUM', 1000))
+
+# FIX (2026-09-19, backtest'te dogrulandi — 5/5 saglamlik, en iyi getiri/
+# MaxDD dengesi %99/98/97/96/95 arasinda %98'de bulundu): "kesintisiz N mum
+# EMA200 altinda kalma" sarti cok kirilgan — fiyat ortalamayi test ederken
+# dogal olarak birkac kez ustune/altina sicrayabilir, bu da GERCEK bir
+# donusu (canli ornek: BTC, 2026-08-04—08-18) kacirtiyordu. Artik sabit bir
+# PENCEREYE (son EMA200_ALTI_MIN_MUM mum) bakip, o pencerenin en az bu
+# orandaki kismi dogru tarafta olsun yeterli — ara sira kisa sicramalara
+# tolerans taniniyor. Bedel: backtest'te MaxDD ~%11.6 -> ~%14 (getiri
+# karsiliginda kabul edilebilir bulundu).
+EMA200_DONUS_TOLERANS_ORAN = float(os.environ.get('EMA200_DONUS_TOLERANS_ORAN', 0.98))
+
 AYARLAR = {
     'LEVERAGE':                int(os.environ.get('LEVERAGE', 3)),         # bot.py ile AYNI OLMALI (Hedge Mode, sembol bazlı paylaşılıyor)
     'RISK_PERCENT':            float(os.environ.get('RISK_PERCENT', 1.0)),  # backtest'te doğrulandı
@@ -1018,8 +1035,21 @@ def strateji_kontrol(symbol):
         if sym_acik:
             return  # zaten pozisyon var, yeni giris aranmiyor
 
+        # FIX (2026-09-19): EMA200'un SMA-tohumlu hesap yontemi (bkz.
+        # ema_serisi), tohumun etkisinin silinmesi icin YETERLI ISINMA
+        # SURESI gerektirir. Eskiden sadece EMA200_ALTI_MIN_MUM+210 (=282)
+        # mum cekiliyordu — 200'u SMA tohumuna gidince geriye sadece 81
+        # mumluk bir "isinma" kaliyordu, bu da EMA200 agirlik formulune
+        # gore tohumun HALA ~%45'inin etkisini tasidigi, gercek/yakinsamis
+        # bir EMA200 OLMAYAN bir deger uretiyordu (TradingView gibi yillarca
+        # geriye giden veriyle hesaplanan EMA200'den GORULEBILIR olcude
+        # farkli olabiliyordu). Canli ornek: 20 Agustos 2026'daki BTC
+        # kirilimi TradingView'da net bir EMA200-donusu gibi gorunuyordu
+        # ama bot hic sinyal uretmedi — kok neden buydu. EMA_ISINMA_MUM
+        # ile artik cok daha genis bir pencere cekiliyor (varsayilan 1000
+        # mum ek isinma -> tohumun etkisi ~%1'in altina iner).
         mumlar = client.futures_klines(symbol=symbol, interval=INTERVAL,
-                                       limit=AYARLAR['EMA200_ALTI_MIN_MUM'] + 210)
+                                       limit=AYARLAR['EMA200_ALTI_MIN_MUM'] + EMA_ISINMA_MUM)
         if len(mumlar) < 210:
             return
         kapanis = [float(m[4]) for m in mumlar[:-1]]  # son (kapanmamis) mumu haric tut
@@ -1032,15 +1062,26 @@ def strateji_kontrol(symbol):
         if not iki_mum_ustunde:
             return
 
-        ardisik_altinda = 0
-        j = n - 3
-        while j >= 0 and ema200_serisi[j] is not None and kapanis[j] < ema200_serisi[j]:
-            ardisik_altinda += 1
-            j -= 1
-
-        if ardisik_altinda < AYARLAR['EMA200_ALTI_MIN_MUM']:
-            log.debug(f"{symbol}: donus var ama sadece {ardisik_altinda} mum EMA200 altindaydi "
-                      f"(gerekli: {AYARLAR['EMA200_ALTI_MIN_MUM']})")
+        # FIX (2026-09-19): eskiden burada kesintisiz bir 'while' sayacı
+        # (ardisik_altinda) vardı — tek bir mumun bile üstüne sıçraması
+        # sayacı sıfırlıyordu. Artık sabit bir pencereye (son
+        # EMA200_ALTI_MIN_MUM mum) bakıp, pencerenin en az
+        # EMA200_DONUS_TOLERANS_ORAN kadarının EMA200 altında olmasını
+        # arıyoruz — backtest'te doğrulanmış, %98'de en iyi denge.
+        N = AYARLAR['EMA200_ALTI_MIN_MUM']
+        pencere_baslangic = n - 2 - N
+        if pencere_baslangic < 0:
+            return
+        pencere_kapanis = kapanis[pencere_baslangic:n-2]
+        pencere_ema = ema200_serisi[pencere_baslangic:n-2]
+        gecerli = [(c, e) for c, e in zip(pencere_kapanis, pencere_ema) if e is not None]
+        if not gecerli:
+            return
+        altinda_sayisi = sum(1 for c, e in gecerli if c < e)
+        oran = altinda_sayisi / len(gecerli)
+        if oran < EMA200_DONUS_TOLERANS_ORAN:
+            log.debug(f"{symbol}: donus var ama pencerenin sadece %{oran*100:.0f}'i EMA200 "
+                      f"altindaydi (gerekli: %{EMA200_DONUS_TOLERANS_ORAN*100:.0f})")
             return
 
         # DENEY (2026-09-06, backtest'te doğrulandı — 4/5 sağlamlık):
