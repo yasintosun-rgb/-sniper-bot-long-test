@@ -645,6 +645,17 @@ def dinamik_kaldirac(symbol):
         client.futures_change_leverage(symbol=symbol, leverage=lev)
     except Exception as e:
         log.error(f"Kaldirac hatasi {symbol}: {e}")
+    # FIX (2026-09-19, kullanıcı sorusu — SHORT/bot.py'de zaten uygulandı):
+    # marjin tipi hesap ekranında Cross görünüyordu — likidasyon durumunda
+    # TÜM hesap bakiyesi risk altında kalabilir. Her pozisyon açılışında
+    # GARANTİLİ olarak Isolated'a geçiyoruz. -4046 (zaten Isolated) zararsız,
+    # sessizce geçilir. NOT: kaldıraç gibi bu da sembol bazında PAYLAŞILIR —
+    # SHORT botu da aynı sembolde Isolated istiyor, çakışma yok.
+    try:
+        client.futures_change_margin_type(symbol=symbol, marginType='ISOLATED')
+    except Exception as e:
+        if '-4046' not in str(e):
+            log.error(f"Marjin tipi ayarlama hatası {symbol}: {e}")
     return lev
 
 
