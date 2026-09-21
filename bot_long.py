@@ -1326,6 +1326,15 @@ async function yukle(){
 yukle();
 </script></body></html>"""
 
+@app.route('/health')
+def health():
+    """FIX (2026-09-21, kullanıcı gözlemi — UptimeRobot bu servise 3+ gündür
+    401 aldığı için ping ATAMIYORDU, bu da Render'ın 15dk hareketsizlik
+    sonrası container'ı TAMAMEN DURDURMASINA yol açtı (11.5 saatlik donma
+    gözlemlendi). Bu endpoint DASHBOARD_TOKEN GEREKTIRMEZ — UptimeRobot'u
+    '/' yerine buraya yönlendirin, böylece her zaman gerçek 200 OK alınır."""
+    return "OK", 200
+
 @app.route('/')
 def dashboard():
     if not dashboard_dogrula(request):
