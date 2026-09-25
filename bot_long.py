@@ -565,6 +565,166 @@ def _btc_volatilite_carpani():
         return 1.0
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# HESAP GENELİ DEVRE KESİCİ (2026-09-25)
+# ════════════════════════════════════════════════════════════════════════════════
+# Aynı Binance hesabını birden fazla strateji paylaşıyor (bu süreçte LONG; ana
+# SHORT + YeniListe ayrı bir serviste, bot.py — AYNI modül orada da var). Mevcut korumalar (günlük NET zarar limiti,
+# DRAWDOWN_LIMIT risk yarılama) sadece ANA SHORT'un kendi işlemlerine bakıyor —
+# hesabın TOPLAM özkaynağındaki düşüşü hiçbir şey izlemiyordu (bkz. 2026-09-18:
+# Lead hesabı 7 günde -%16, 35 eşzamanlı pozisyon).
+#
+# NE YAPAR: hesabın özkaynağını (cüzdan + gerçekleşmemiş K/Z) son
+# DEVRE_KESICI_PENCERE_GUN günün TEPESİYLE karşılaştırır. Düşüş
+# DEVRE_KESICI_DD_YUZDE'yi aşarsa bu süreçteki TÜM stratejilerde YENİ GİRİŞ durur.
+# Açık pozisyonlara DOKUNMAZ — borsadaki stop emirleri onları korumaya devam eder
+# (panik anında toplu market kapatma genelde en kötü fiyattan olur).
+#
+# TEPE, DURUM DOSYASI GEREKTİRMEDEN hesaplanır: Binance gelir geçmişinden
+# (REALIZED_PNL/COMMISSION/FUNDING_FEE...) son N günün cüzdan eğrisi yeniden
+# kurulur. Böylece diski olmayan servislerde (sniper-bot-lead) restart sonrası
+# da doğru çalışır ve aynı hesaptaki iki servis (bot.py + bot_long.py) birbirinden
+# habersiz AYNI sonuca varır. Para yatırma/çekme (TRANSFER vb.) performans
+# sayılmaz — çekim yapmak devre kesiciyi tetiklemez.
+#
+# YENİDEN AÇILMA: düşüş eşiğin altına inerse (tepe pencereden çıkınca ya da
+# özkaynak toparlanınca) ve en az DEVRE_KESICI_MIN_DURUS_SAAT geçtiyse otomatik.
+# Elle: Telegram /devre_sifirla (tepe referansını ŞİMDİYE çeker). Restart'a
+# dayanıklı elle sıfırlama için: DEVRE_KESICI_SIFIRLAMA=2026-09-25T12:00 env var.
+DEVRE_KESICI_AKTIF = os.environ.get('DEVRE_KESICI_AKTIF', 'true').lower() in ('1', 'true', 'evet', 'yes')
+DEVRE_KESICI_DD_YUZDE = float(os.environ.get('DEVRE_KESICI_DD_YUZDE', 15.0))      # 5-50 makul
+DEVRE_KESICI_PENCERE_GUN = int(os.environ.get('DEVRE_KESICI_PENCERE_GUN', 30))    # 7-90
+DEVRE_KESICI_KONTROL_SN = int(os.environ.get('DEVRE_KESICI_KONTROL_SN', 300))     # 60-3600
+DEVRE_KESICI_MIN_DURUS_SAAT = float(os.environ.get('DEVRE_KESICI_MIN_DURUS_SAAT', 24))
+_DK_PERFORMANS_TIPLERI = {'REALIZED_PNL', 'COMMISSION', 'FUNDING_FEE', 'INSURANCE_CLEAR',
+                          'COMMISSION_REBATE', 'API_REBATE', 'REFERRAL_KICKBACK',
+                          'DELIVERED_SETTELMENT', 'AUTO_EXCHANGE'}
+
+
+def _dk_env_sifirlama_ms():
+    ham = os.environ.get('DEVRE_KESICI_SIFIRLAMA', '').strip()
+    if not ham:
+        return 0
+    try:
+        dt = datetime.fromisoformat(ham)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        log.error(f"[DevreKesici] DEVRE_KESICI_SIFIRLAMA okunamadı: {ham!r} (örnek: 2026-09-25T12:00)")
+        return 0
+
+
+DEVRE_KESICI_TETIK = False
+_dk_durum = {'gelirler': {}, 'son_ms': 0, 'sifirlama_ms': _dk_env_sifirlama_ms(),
+             'tetik_ms': 0, 'son': None, 'hata_sayisi': 0}
+_dk_lock = threading.Lock()
+
+
+def _dk_gelirleri_guncelle(simdi_ms):
+    """Gelir geçmişini artımlı çeker (ilk seferde pencere kadar geriye)."""
+    pencere_bas = simdi_ms - DEVRE_KESICI_PENCERE_GUN * 86_400_000
+    # 10 dk örtüşme: Binance bazı gelir kayıtlarını gecikmeli yayınlar; kayıtlar
+    # anahtarla tekilleştirildiği için çift sayılmaz.
+    bas = max(_dk_durum['son_ms'] - 600_000, pencere_bas)
+    for _ in range(50):  # sayfalama güvenlik sınırı
+        parca = client.futures_income_history(startTime=bas, endTime=simdi_ms, limit=1000)
+        for g in parca:
+            anahtar = (g.get('tranId'), g.get('incomeType'), g.get('symbol'), g.get('time'))
+            _dk_durum['gelirler'][anahtar] = (int(g['time']), g.get('incomeType'), float(g['income']))
+        if len(parca) < 1000:
+            break
+        bas = int(parca[-1]['time']) + 1
+    _dk_durum['son_ms'] = simdi_ms
+    # pencere dışına düşenleri at (bellek)
+    for k in [k for k, v in _dk_durum['gelirler'].items() if v[0] < pencere_bas]:
+        del _dk_durum['gelirler'][k]
+
+
+def devre_kesici_hesapla():
+    """Döner: {'ozkaynak','tepe','dd'} ya da None (hata)."""
+    simdi_ms = int(time.time() * 1000)
+    hesap = client.futures_account()
+    cuzdan = float(hesap['totalWalletBalance'])
+    ozkaynak = cuzdan + float(hesap['totalUnrealizedProfit'])
+    _dk_gelirleri_guncelle(simdi_ms)
+    pencere_bas = max(simdi_ms - DEVRE_KESICI_PENCERE_GUN * 86_400_000, _dk_durum['sifirlama_ms'])
+    olaylar = sorted((t, tutar) for t, tip, tutar in _dk_durum['gelirler'].values()
+                     if tip in _DK_PERFORMANS_TIPLERI and t >= pencere_bas)
+    # Geriye doğru: her olaydan hemen sonraki "performans cüzdanı"
+    toplam_sonra = sum(t for _, t in olaylar)
+    seviye = cuzdan - toplam_sonra          # pencere başındaki seviye
+    tepe = max(seviye, ozkaynak)
+    for _, tutar in olaylar:
+        seviye += tutar
+        tepe = max(tepe, seviye)
+    dd = (tepe - ozkaynak) / tepe * 100 if tepe > 0 else 0.0
+    return {'ozkaynak': ozkaynak, 'tepe': tepe, 'dd': max(dd, 0.0)}
+
+
+def devre_kesici_kontrol():
+    global DEVRE_KESICI_TETIK
+    if not DEVRE_KESICI_AKTIF:
+        return
+    with _dk_lock:
+        try:
+            s = devre_kesici_hesapla()
+            _dk_durum['hata_sayisi'] = 0
+        except Exception as e:
+            _dk_durum['hata_sayisi'] += 1
+            log.error(f"[DevreKesici] hesaplama hatası ({_dk_durum['hata_sayisi']}): {e}")
+            if _dk_durum['hata_sayisi'] == 6:
+                tg(f"⚠️ [DevreKesici] 6 kez üst üste hesaplanamadı — son durum korunuyor "
+                   f"({'TETİKLİ' if DEVRE_KESICI_TETIK else 'normal'}). Hata: {e}")
+            return
+        _dk_durum['son'] = s
+        simdi_ms = int(time.time() * 1000)
+        if not DEVRE_KESICI_TETIK and s['dd'] >= DEVRE_KESICI_DD_YUZDE:
+            DEVRE_KESICI_TETIK = True
+            _dk_durum['tetik_ms'] = simdi_ms
+            log.error(f"[DevreKesici] TETİKLENDİ: düşüş %{s['dd']:.2f} >= %{DEVRE_KESICI_DD_YUZDE}")
+            tg(f"🛑 HESAP DEVRE KESİCİSİ TETİKLENDİ\n"
+               f"Özkaynak {s['ozkaynak']:.2f} USDT, son {DEVRE_KESICI_PENCERE_GUN} günün tepesi "
+               f"{s['tepe']:.2f} USDT → düşüş %{s['dd']:.2f} (eşik %{DEVRE_KESICI_DD_YUZDE:.0f})\n"
+               f"Bu serviste TÜM stratejilerde yeni giriş DURDU. Açık pozisyonlar borsadaki "
+               f"stoplarıyla korunmaya devam ediyor.\n"
+               f"En erken otomatik açılma: {DEVRE_KESICI_MIN_DURUS_SAAT:.0f} saat sonra (düşüş eşiğin "
+               f"altına inerse). Elle: /devre_sifirla")
+        elif DEVRE_KESICI_TETIK and s['dd'] < DEVRE_KESICI_DD_YUZDE:
+            gecen_saat = (simdi_ms - _dk_durum['tetik_ms']) / 3_600_000
+            if gecen_saat >= DEVRE_KESICI_MIN_DURUS_SAAT:
+                DEVRE_KESICI_TETIK = False
+                tg(f"🟢 Hesap devre kesicisi kendiliğinden AÇILDI (düşüş %{s['dd']:.2f} < "
+                   f"%{DEVRE_KESICI_DD_YUZDE:.0f}, {gecen_saat:.0f} saattir kapalıydı). Yeni girişler serbest.")
+
+
+def devre_kesici_sifirla():
+    """Elle sıfırlama: tepe referansı şimdiye çekilir, kesici açılır."""
+    global DEVRE_KESICI_TETIK
+    with _dk_lock:
+        _dk_durum['sifirlama_ms'] = int(time.time() * 1000)
+        DEVRE_KESICI_TETIK = False
+    devre_kesici_kontrol()
+
+
+def devre_kesici_ozet():
+    if not DEVRE_KESICI_AKTIF:
+        return "🛡️ Hesap devre kesicisi: kapalı (DEVRE_KESICI_AKTIF=false)"
+    s = _dk_durum['son']
+    durum = '🔴 TETİKLİ (yeni giriş yok)' if DEVRE_KESICI_TETIK else '🟢 normal'
+    if s is None:
+        return f"🛡️ Hesap devre kesicisi: {durum} — henüz hesaplanmadı"
+    return (f"🛡️ Hesap devre kesicisi: {durum}\n"
+            f"   Özkaynak {s['ozkaynak']:.2f} / tepe {s['tepe']:.2f} USDT → düşüş %{s['dd']:.2f} "
+            f"(eşik %{DEVRE_KESICI_DD_YUZDE:.0f}, pencere {DEVRE_KESICI_PENCERE_GUN} gün)")
+
+
+def devre_kesici_dongusu():
+    while True:
+        devre_kesici_kontrol()
+        time.sleep(max(60, DEVRE_KESICI_KONTROL_SN))
+
+
 def efektif_risk_percent():
     b = bakiye()
     if baslangic_bakiye <= 0:
@@ -787,6 +947,9 @@ def buy(symbol, fiyat):
         return  # güvenlik — bu bot her zaman LONG olmalı, savunma amaçlı
     if bot_durduruldu:
         log.info(f"{symbol} sinyali atlandi: bot durduruldu")
+        return
+    if DEVRE_KESICI_TETIK:
+        log.info(f"{symbol} sinyali atlandi: hesap devre kesicisi tetikli")
         return
 
     with lock:
@@ -1207,7 +1370,13 @@ def telegram_komut():
             tg(f"📊 LONG DURUM {'🔴 DURDURULDU' if bot_durduruldu else '🟢 AKTİF'}\n"
                f"Bakiye:{round(bakiye(),2)} USDT\nAçık:{acik_say} Günlük:{gunluk}/{AYARLAR['MAX_GUNLUK_ISLEM']}\n"
                f"Risk:%{AYARLAR['RISK_PERCENT']} Trailing:%{AYARLAR['PERCENT_TRAILING_MESAFE']} MaxOpen:{AYARLAR['MAX_OPEN_TRADES']}\n"
-               f"Günlük NET K/Z:{round(gunluk_net_kz,2)} USDT")
+               f"Günlük NET K/Z:{round(gunluk_net_kz,2)} USDT\n"+devre_kesici_ozet())
+        elif cmd == '/devre':
+            tg(devre_kesici_ozet())
+        elif cmd == '/devre_sifirla':
+            devre_kesici_sifirla()
+            tg("🟢 Hesap devre kesicisi elle SIFIRLANDI (LONG) — tepe referansı şimdiye çekildi.\n"+devre_kesici_ozet()+
+               "\n(Not: SHORT servisinde de ayrıca /devre_sifirla gönderin; restart sonrası kalıcılık için DEVRE_KESICI_SIFIRLAMA env var.)")
         elif cmd == '/bakiye':
             tg(f"💰 Bakiye: {round(bakiye(),2)} USDT")
         elif cmd == '/acik':
@@ -1447,5 +1616,10 @@ if __name__ == '__main__':
             log.error(f"Orphan emir kontrol hatasi: {e}")
     except Exception as e:
         log.error(f"Baslangic hatasi: {e}")
+    # FIX (2026-09-25): hesap devre kesicisi — tarama başlamadan önce bir kez senkron.
+    if DEVRE_KESICI_AKTIF:
+        devre_kesici_kontrol()
+        log.info(devre_kesici_ozet())
+        threading.Thread(target=devre_kesici_dongusu, daemon=True).start()
     threading.Thread(target=tarama_dongusu, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5001)), debug=False)
