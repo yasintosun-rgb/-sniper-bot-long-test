@@ -133,6 +133,23 @@ AYARLAR = {
     'MAX_TOPLAM_RISK':         float(os.environ.get('MAX_TOPLAM_RISK', 5.0)),
 }
 
+# ── PİRAMİTLEME (2026-09-26, backtest_rolling_v2_KESIN.py LONG_PIRAMIT_TEST ile doğrulandı) ──
+# Gerçekçi motor 2022-08→2026-08: piramitsiz Getiri +%91 / MaxDD %24.3 (Getiri/DD 3.74) →
+# +%7'de 1 ekleme 1x: +%182 / %26.3 (Getiri/DD 6.91), 5/5 dilim; 9 varyantın 9'u da daha iyi.
+# Fiyat İLK GİRİŞİN +%PIRAMIT_ADIM_YUZDE üstüne çıkınca, ilk miktarın PIRAMIT_BOYUT katı
+# eklenir (en fazla PIRAMIT_MAX kez). Stop emri closePosition=True olduğu için eklenen
+# miktarı da otomatik kapsar. İlk giriş fiyatı ('e0') ayrıca saklanır — Binance'in
+# ortalama giriş fiyatı trailing hesabında KULLANILMAZ.
+PIRAMIT_AKTIF = os.environ.get('PIRAMIT_AKTIF', 'true').lower() in ('1', 'true', 'evet', 'yes')
+PIRAMIT_ADIM_YUZDE = float(os.environ.get('PIRAMIT_ADIM_YUZDE', 7.0))
+PIRAMIT_MAX = int(os.environ.get('PIRAMIT_MAX', 1))
+PIRAMIT_BOYUT = float(os.environ.get('PIRAMIT_BOYUT', 1.0))
+# TRAILING HESABI (2026-09-26): backtest (ve tüm LONG doğrulamaları) stop mesafesini
+# İLK GİRİŞ fiyatının %'si olarak SABİT tutar: SL = en_yüksek − e0 × %mesafe.
+# Canlı eskiden SL = en_yüksek × (1 − %mesafe) kullanıyordu (fiyat yükseldikçe mesafe
+# büyür, backtest'ten gevşek). 'GIRIS' = backtest ile birebir (varsayılan); 'ZIRVE' = eski.
+TRAILING_MOD = os.environ.get('TRAILING_MOD', 'GIRIS').strip().upper()
+
 INTERVAL = '1h'   # backtest'te doğrulanmış zaman dilimi — SHORT bot'un 15dk'sından FARKLI
 WARMUP_MUM = 250  # EMA200 ısınması için ekstra geçmiş mum
 
@@ -1014,6 +1031,7 @@ def buy(symbol, fiyat):
             acik[symbol] = {
                 'entry': gercek, 'sl': sl_gercek, 'en_yuksek_fiyat': gercek,
                 'q': m, 'lev': lev, 'acilis_zaman': int(time.time() * 1000),
+                'e0': gercek, 'q0': m, 'piramit_ek': 0,
             }
             gunluk_islem += 1
             son_islem_zamani[symbol] = time.time()
@@ -1059,6 +1077,74 @@ def kapat(symbol, sebep="EXIT"):
         log.error(f"Kapatma hata {symbol}: {e}")
 
 
+def _piramit_kontrol(symbol, mark):
+    """Fiyat ilk girişin +%PIRAMIT_ADIM_YUZDE × (ek+1) seviyesine ulaştıysa pozisyona ekler."""
+    with lock:
+        islem = acik.get(symbol)
+        if not islem or islem.get('_rezerve') or islem.get('_piramit_suruyor'):
+            return
+        e0 = islem.get('e0', islem['entry'])
+        ek = islem.get('piramit_ek', 0)
+        q0 = islem.get('q0', islem['q'])
+        if ek >= PIRAMIT_MAX or mark < e0 * (1 + PIRAMIT_ADIM_YUZDE * (ek + 1) / 100):
+            return
+        islem['_piramit_suruyor'] = True
+    try:
+        if bot_durduruldu or DEVRE_KESICI_TETIK:
+            log.info(f"{symbol}: piramit seviyesi geldi ama ekleme atlandı "
+                     f"({'/durdur' if bot_durduruldu else 'devre kesici'})")
+            return
+        cache = exchange_info_al()
+        b = bakiye()
+        qa = q0 * PIRAMIT_BOYUT
+        tavan_q = (b * 0.20 * AYARLAR['LEVERAGE']) / mark - islem['q']   # miktar_hesapla ile aynı tavan
+        if qa > tavan_q:
+            qa = max(tavan_q, 0.0)
+        if symbol in cache:
+            step = cache[symbol]['step']
+            qa = math.floor(qa / step + 1e-9) * step
+            qa = max(1, int(qa)) if step >= 1 and qa >= 1 else round(qa, cache[symbol]['lp'])
+            if qa * mark < cache[symbol]['min_notional']:
+                qa = 0
+        if qa <= 0:
+            log.info(f"{symbol}: piramit ekleme miktarı sıfır (tavan/min notional) — atlandı")
+            with lock:
+                if symbol in acik:
+                    acik[symbol]['piramit_ek'] = ek + 1   # tekrar tekrar denemesin
+            durum_kaydet()
+            return
+        order = binance_emir_gonder(client.futures_create_order,
+                                    idempotency_prefix='PIR_L', sym_key=symbol,
+                                    symbol=symbol, side='BUY', type='MARKET', quantity=qa,
+                                    positionSide='LONG')
+        fill = _fill_fiyati_al(order, symbol)
+        yeni_q = islem['q'] + qa
+        with lock:
+            if symbol in acik:
+                i = acik[symbol]
+                yeni_q = i['q'] + qa
+                i['entry'] = (i['entry'] * i['q'] + fill * qa) / yeni_q   # ortalama (K/Z raporu için)
+                i['q'] = yeni_q
+                i['e0'] = e0
+                i['q0'] = q0
+                i['piramit_ek'] = ek + 1
+        durum_kaydet()
+        tg(f"➕ LONG PİRAMİT {symbol}\nİlk giriş {e0} → +%{(fill/e0-1)*100:.1f} seviyesinde {qa} eklendi @ {fill}\n"
+           f"Toplam miktar {yeni_q} | ekleme {ek+1}/{PIRAMIT_MAX} | stop (closePosition) tüm pozisyonu kapsıyor")
+        log.info(f"{symbol}: piramit eklemesi {qa} @ {fill} (ilk giriş {e0}, ekleme {ek+1}/{PIRAMIT_MAX})")
+    except Exception as e:
+        log.error(f"{symbol}: piramit ekleme hatası: {e}")
+        tg(f"⚠️ {symbol} (LONG) piramit eklemesi başarısız: {e}")
+        with lock:
+            if symbol in acik:
+                acik[symbol]['piramit_ek'] = ek + 1   # hata döngüsüne girmesin
+        durum_kaydet()
+    finally:
+        with lock:
+            if symbol in acik:
+                acik[symbol].pop('_piramit_suruyor', None)
+
+
 def trailing_guncelle(pozisyonlar=None):
     """
     Bu stratejinin KALBİ — sabit TP/breakeven yerine SÜREKLİ trailing.
@@ -1078,11 +1164,19 @@ def trailing_guncelle(pozisyonlar=None):
             continue
         try:
             mark = float(p['markPrice'])
+            if PIRAMIT_AKTIF:
+                _piramit_kontrol(symbol, mark)
+                with lock:
+                    islem = dict(acik.get(symbol, islem))
+            e0 = islem.get('e0', islem['entry'])
             en_yuksek_eski = islem.get('en_yuksek_fiyat', islem['entry'])
             en_yuksek_yeni = max(en_yuksek_eski, mark)
             if en_yuksek_yeni <= en_yuksek_eski:
                 continue  # yeni zirve yok, SL'i tekrar gondermeye gerek yok
-            yeni_sl = en_yuksek_yeni * (1 - mesafe_yuzde)
+            if TRAILING_MOD == 'ZIRVE':
+                yeni_sl = en_yuksek_yeni * (1 - mesafe_yuzde)
+            else:
+                yeni_sl = en_yuksek_yeni - e0 * mesafe_yuzde
             if yeni_sl <= islem.get('sl', 0):
                 with lock:
                     if symbol in acik:
@@ -1279,7 +1373,10 @@ def strateji_kontrol(symbol):
             log.warning(f"{symbol}: hacim onayi hesaplanamadi, filtre uygulanmadan devam ediliyor: {e}")
 
         fiyat = kapanis[-1]
-        log.info(f"LONG sinyali: {symbol}@{fiyat} ({ardisik_altinda} mum EMA200 altindan donus)")
+        # FIX (2026-09-26, KRİTİK): burada eskiden silinmiş 'ardisik_altinda' değişkeni
+        # kullanılıyordu → her gerçek sinyalde NameError, buy() HİÇ çağrılmıyordu
+        # (19 Eylül tolerans düzeltmesinden beri sessiz arıza).
+        log.info(f"LONG sinyali: {symbol}@{fiyat} (pencerenin %{oran*100:.0f}'i EMA200 altındaydı, dönüş)")
         buy(symbol, fiyat)
     except Exception as e:
         log.error(f"Strateji hatasi {symbol}: {e}")
@@ -1303,7 +1400,8 @@ def tarama_dongusu():
                          f"CANLIYA ALMADAN ÖNCE bu değeri 72'ye geri döndürün!")
         log.warning(f"TEST MODU: EMA200_ALTI_MIN_MUM={AYARLAR['EMA200_ALTI_MIN_MUM']} (doğrulanmış değer: 72) — CANLIYA ALMADAN ÖNCE DÜZELTİN!")
     tg(f"🤖 LONG BOT BAŞLADI\nBakiye:{bakiye()} USDT Kaldıraç:{AYARLAR['LEVERAGE']}x\n"
-       f"Risk:%{AYARLAR['RISK_PERCENT']} Trailing:%{AYARLAR['PERCENT_TRAILING_MESAFE']}\n"
+       f"Risk:%{AYARLAR['RISK_PERCENT']} Trailing:%{AYARLAR['PERCENT_TRAILING_MESAFE']} ({TRAILING_MOD})\n"
+       f"Piramit: {'AÇIK' if PIRAMIT_AKTIF else 'kapalı'} (+%{PIRAMIT_ADIM_YUZDE:g}, {PIRAMIT_MAX} ek, {PIRAMIT_BOYUT:g}x)\n"
        f"Strateji: EMA200 dönüşü ({AYARLAR['EMA200_ALTI_MIN_MUM']} saat) — 1sa zaman dilimi"
        f"{_test_uyarisi}")
     while True:
@@ -1387,7 +1485,8 @@ def telegram_komut():
                     msg = "📈 AÇIK LONG POZİSYONLAR:\n"
                     for sym, i in acik.items():
                         if i.get('_rezerve'): continue
-                        msg += f"\n{sym} Giriş:{i['entry']} SL:{round(i['sl'],4)} En yüksek:{round(i.get('en_yuksek_fiyat',i['entry']),4)}\n"
+                        msg += (f"\n{sym} Giriş:{i['entry']} SL:{round(i['sl'],4)} En yüksek:{round(i.get('en_yuksek_fiyat',i['entry']),4)}"
+                                f" | ilk giriş:{i.get('e0', i['entry'])} ekleme:{i.get('piramit_ek', 0)}/{PIRAMIT_MAX}\n")
                     tg(msg)
         elif cmd.startswith('/kapat'):
             parcalar = metin.strip().split()
@@ -1590,6 +1689,9 @@ if __name__ == '__main__':
                     'en_yuksek_fiyat': giris,  # restart sonrasi bilinmiyor, guvenli varsayim: girisle basla
                     'q': abs(float(p['positionAmt'])), 'lev': AYARLAR['LEVERAGE'],
                     'acilis_zaman': int(time.time() * 1000),
+                    # hafıza kaybolmuş: ilk giriş/ekleme durumu bilinmiyor → güvenli taraf:
+                    # bu pozisyona piramit EKLENMEZ (çift ekleme riski olmasın)
+                    'e0': giris, 'q0': abs(float(p['positionAmt'])), 'piramit_ek': PIRAMIT_MAX,
                 }
                 log.info(f"LONG pozisyon yuklendi: {sym} giris:{giris} SL:{sl_f}")
 
