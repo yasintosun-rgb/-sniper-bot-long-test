@@ -1371,8 +1371,9 @@ def strateji_kontrol(symbol):
     try:
         with lock:
             sym_acik = symbol in acik and not acik[symbol].get('_rezerve')
-        if sym_acik:
-            return  # zaten pozisyon var, yeni giris aranmiyor
+        lead_acik = (not LEAD_LONG_AKTIF) or symbol in LEAD_LONG
+        if sym_acik and lead_acik:
+            return  # iki hesapta da pozisyon var, yeni giris aranmiyor
 
         # FIX (2026-09-19): EMA200'un SMA-tohumlu hesap yontemi (bkz.
         # ema_serisi), tohumun etkisinin silinmesi icin YETERLI ISINMA
@@ -1448,7 +1449,10 @@ def strateji_kontrol(symbol):
         # kullanılıyordu → her gerçek sinyalde NameError, buy() HİÇ çağrılmıyordu
         # (19 Eylül tolerans düzeltmesinden beri sessiz arıza).
         log.info(f"LONG sinyali: {symbol}@{fiyat} (pencerenin %{oran*100:.0f}'i EMA200 altındaydı, dönüş)")
-        buy(symbol, fiyat)
+        if not sym_acik:
+            buy(symbol, fiyat)
+        if LEAD_LONG_AKTIF:
+            lead_long_ac(symbol, fiyat)   # copy hesabı — ana hesaptan BAĞIMSIZ
     except Exception as e:
         log.error(f"Strateji hatasi {symbol}: {e}")
 
@@ -1473,7 +1477,8 @@ def tarama_dongusu():
     tg(f"🤖 LONG BOT BAŞLADI\nBakiye:{bakiye()} USDT Kaldıraç:{AYARLAR['LEVERAGE']}x\n"
        f"Risk:%{AYARLAR['RISK_PERCENT']} Trailing:%{AYARLAR['PERCENT_TRAILING_MESAFE']} ({TRAILING_MOD})\n"
        f"Piramit: {'AÇIK' if PIRAMIT_AKTIF else 'kapalı'} (+%{PIRAMIT_ADIM_YUZDE:g}, {PIRAMIT_MAX} ek, {PIRAMIT_BOYUT:g}x)\n"
-       f"Strateji: EMA200 dönüşü ({AYARLAR['EMA200_ALTI_MIN_MUM']} saat) — 1sa zaman dilimi"
+       f"Strateji: EMA200 dönüşü ({AYARLAR['EMA200_ALTI_MIN_MUM']} saat) — 1sa zaman dilimi\n"
+       f"Copy (Lead) LONG yansıtma: {'AÇIK (risk %' + format(LEAD_LONG_RISK_PERCENT, 'g') + ', ' + str(LEAD_LONG_LEVERAGE) + 'x)' if LEAD_LONG_AKTIF else 'KAPALI'}"
        f"{_test_uyarisi}")
     while True:
         log.info("Yeni dongu iterasyonu basliyor...")
@@ -1499,6 +1504,8 @@ def tarama_dongusu():
             log.info(f"Pozisyonlar alindi ({len(pozisyonlar)}). Trailing guncelleniyor...")
             trailing_guncelle(pozisyonlar)
             log.info("Trailing guncelleme bitti.")
+            if LEAD_LONG_AKTIF:
+                lead_long_yonet()
 
             if DINAMIK_COIN_EVRENI:
                 SYMBOLS = en_yuksek_hacimli_coinler_long()
@@ -1542,6 +1549,8 @@ def telegram_komut():
                f"Günlük NET K/Z:{round(gunluk_net_kz,2)} USDT\n"+devre_kesici_ozet())
         elif cmd == '/devre':
             tg(devre_kesici_ozet())
+        elif cmd == '/copy':
+            tg(lead_long_ozet())
         elif cmd == '/devre_sifirla':
             devre_kesici_sifirla()
             tg("🟢 Hesap devre kesicisi elle SIFIRLANDI (LONG) — tepe referansı şimdiye çekildi.\n"+devre_kesici_ozet()+
@@ -1707,6 +1716,321 @@ def journal_indir():
 # BAŞLANGIÇ
 # ════════════════════════════════════════════════════════════════════════════════
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# COPY (LEAD) HESABI — LONG YANSITMA (2026-09-26)
+# ════════════════════════════════════════════════════════════════════════════════
+# Sermayenin büyük kısmı copy (Lead Trading) hesabında; ana hesapta ~$21 kaldığı için
+# LONG ana hesapta anlamlı büyüklükte işlem açamıyordu. Bu modül her LONG sinyalini
+# copy hesabında da, KENDİ bakiyesine göre boyutlandırarak açar ve ana hesaptan
+# TAMAMEN BAĞIMSIZ yönetir (kendi durum dosyası, kendi stop emri, kendi trailing +
+# piramit, kendi sahipsiz-pozisyon kurtarması). Kurallar ana LONG ile birebir aynı:
+# %PERCENT_TRAILING_MESAFE stop (TRAILING_MOD), +%PIRAMIT_ADIM_YUZDE'de piramit.
+# Env: LEAD_API_KEY / LEAD_API_SECRET (SHORT servisindekiyle AYNI anahtarlar),
+#      LEAD_LONG_AKTIF (varsayılan true), LEAD_LONG_RISK_PERCENT (varsayılan RISK_PERCENT),
+#      LEAD_LONG_MAX_OPEN (varsayılan MAX_OPEN_TRADES),
+#      LEAD_LEVERAGE (varsayılan 2 — copy hesabındaki YeniListe SHORT'larıyla AYNI olmalı,
+#      çünkü kaldıraç sembol bazında iki yön arasında paylaşılır).
+LEAD_API_KEY = os.environ.get('LEAD_API_KEY', '')
+LEAD_API_SECRET = os.environ.get('LEAD_API_SECRET', '')
+LEAD_LONG_AKTIF = (bool(LEAD_API_KEY and LEAD_API_SECRET)
+                   and os.environ.get('LEAD_LONG_AKTIF', 'true').lower() in ('1', 'true', 'evet', 'yes'))
+lead_client = Client(LEAD_API_KEY, LEAD_API_SECRET, requests_params={'timeout': 20}) if LEAD_LONG_AKTIF else None
+LEAD_LONG_RISK_PERCENT = float(os.environ.get('LEAD_LONG_RISK_PERCENT', AYARLAR['RISK_PERCENT']))
+LEAD_LONG_MAX_OPEN = int(os.environ.get('LEAD_LONG_MAX_OPEN', AYARLAR['MAX_OPEN_TRADES']))
+LEAD_LONG_LEVERAGE = int(os.environ.get('LEAD_LEVERAGE', 2))
+LEAD_LONG_DOSYA = PERSIST_DIR / 'lead_long_durum.json'
+LEAD_LONG = {}                 # symbol -> {'entry','e0','q','q0','sl','en_yuksek_fiyat','piramit_ek','acilis_zaman'}
+LEAD_LONG_SON_KAPANIS = {}     # symbol -> zaman (cooldown)
+_ll_lock = threading.Lock()
+_ll_atlama_son = {'t': 0.0, 'adet': 0}
+
+
+def _ll_kaydet():
+    try:
+        with _ll_lock:
+            veri = {'poz': {k: dict(v) for k, v in LEAD_LONG.items()}, 'kapanis': dict(LEAD_LONG_SON_KAPANIS)}
+        LEAD_LONG_DOSYA.write_text(json.dumps(veri), encoding='utf-8')
+    except Exception as e:
+        log.error(f"[LeadLONG] Durum kaydetme hatası: {e}")
+
+
+def _ll_yukle():
+    global LEAD_LONG, LEAD_LONG_SON_KAPANIS
+    try:
+        if LEAD_LONG_DOSYA.exists():
+            veri = json.loads(LEAD_LONG_DOSYA.read_text(encoding='utf-8'))
+            LEAD_LONG = veri.get('poz', {})
+            LEAD_LONG_SON_KAPANIS = {k: float(v) for k, v in veri.get('kapanis', {}).items()}
+            log.info(f"[LeadLONG] Durum yüklendi: {len(LEAD_LONG)} pozisyon")
+    except Exception as e:
+        log.error(f"[LeadLONG] Durum yükleme hatası: {e}")
+
+
+def _ll_bakiye():
+    try:
+        for v in lead_client.futures_account_balance():
+            if v['asset'] == 'USDT':
+                return float(v.get('availableBalance', v['balance']))
+    except Exception as e:
+        log.error(f"[LeadLONG] Bakiye sorgu hatası: {e}")
+    return None
+
+
+def _ll_miktar_yuvarla(symbol, q, fiyat):
+    c = exchange_info_al()
+    if symbol not in c:
+        return round(q, 3), 5.0
+    step = c[symbol]['step']
+    q = math.floor(q / step + 1e-9) * step
+    q = int(q) if step >= 1 else round(q, c[symbol]['lp'])
+    return q, c[symbol]['min_notional']
+
+
+def _ll_stoplari_iptal(symbol):
+    for kosullu in (False, True):
+        try:
+            emirler = lead_client.futures_get_open_orders(symbol=symbol, conditional=True) if kosullu \
+                else lead_client.futures_get_open_orders(symbol=symbol)
+        except Exception as e:
+            log.debug(f"[LeadLONG] {symbol} emir listesi alınamadı: {e}")
+            continue
+        for o in emirler:
+            if o.get('positionSide') != 'LONG':
+                continue
+            try:
+                if kosullu:
+                    algo_id = o.get('algoId')
+                    if algo_id:
+                        lead_client.futures_cancel_algo_order(symbol=symbol, algoId=algo_id)
+                    else:
+                        lead_client.futures_cancel_order(symbol=symbol, orderId=o['orderId'], conditional=True)
+                else:
+                    lead_client.futures_cancel_order(symbol=symbol, orderId=o['orderId'])
+            except Exception as e:
+                log.debug(f"[LeadLONG] {symbol} emir iptal hatası: {e}")
+
+
+def _ll_stop_gonder(symbol, stop):
+    fp, _ = precision_al(symbol)
+    params = {'symbol': symbol, 'side': 'SELL', 'type': 'STOP_MARKET', 'positionSide': 'LONG',
+              'closePosition': True}
+    try:
+        return lead_client.futures_create_algo_order(triggerPrice=round(stop, fp), **params)
+    except Exception as e:
+        log.warning(f"[LeadLONG] {symbol}: algo stop başarısız ({e}), eski API deneniyor")
+        return lead_client.futures_create_order(stopPrice=round(stop, fp), **params)
+
+
+def _ll_mevcut_stop(symbol):
+    try:
+        for o in lead_client.futures_get_open_orders(symbol=symbol, conditional=True):
+            tip = str(o.get('type') or o.get('orderType') or o.get('origType') or '').upper()
+            if o.get('positionSide') == 'LONG' and 'STOP' in tip:
+                return float(o.get('triggerPrice') or o.get('stopPrice') or 0) or None
+    except Exception:
+        pass
+    return None
+
+
+def lead_long_ac(symbol, fiyat):
+    """Ana hesaptan BAĞIMSIZ: copy hesabında LONG aç (kendi bakiyesine göre)."""
+    if not LEAD_LONG_AKTIF or bot_durduruldu or DEVRE_KESICI_TETIK:
+        return
+    with _ll_lock:
+        if symbol in LEAD_LONG or len(LEAD_LONG) >= LEAD_LONG_MAX_OPEN:
+            return
+        if time.time() - LEAD_LONG_SON_KAPANIS.get(symbol, 0) < AYARLAR['COOLDOWN_SURE']:
+            return
+        LEAD_LONG[symbol] = {'_rezerve': True}
+    try:
+        b = _ll_bakiye()
+        if not b or b <= 0:
+            raise RuntimeError("copy hesabı bakiyesi alınamadı")
+        try:
+            lead_client.futures_change_leverage(symbol=symbol, leverage=LEAD_LONG_LEVERAGE)
+        except Exception as e:
+            log.error(f"[LeadLONG] Kaldıraç hatası {symbol}: {e}")
+        try:
+            lead_client.futures_change_margin_type(symbol=symbol, marginType='ISOLATED')
+        except Exception as e:
+            if '-4046' not in str(e):
+                log.error(f"[LeadLONG] Marjin tipi hatası {symbol}: {e}")
+        mesafe = AYARLAR['PERCENT_TRAILING_MESAFE'] / 100
+        risk = b * LEAD_LONG_RISK_PERCENT / 100
+        if VOLATILITE_BOYUTLANDIRMA_AKTIF:
+            risk *= _btc_volatilite_carpani()
+        sl_m = fiyat * mesafe - fiyat * AYARLAR['KOMISYON_ORAN'] * 2
+        q = risk / sl_m if sl_m > 0 else 0
+        q = min(q, (b * 0.20 * LEAD_LONG_LEVERAGE) / fiyat)
+        q, min_n = _ll_miktar_yuvarla(symbol, q, fiyat)
+        if q <= 0 or q * fiyat < min_n:
+            _ll_atlama(symbol, f"${q*fiyat:.2f} pozisyon < minimum ${min_n:g} (bakiye ${b:.2f})")
+            with _ll_lock:
+                LEAD_LONG.pop(symbol, None)
+            return
+        order = lead_client.futures_create_order(symbol=symbol, side='BUY', type='MARKET', quantity=q,
+                                                 positionSide='LONG')
+        gercek = float((order or {}).get('avgPrice') or 0) or fiyat
+        _ll_stoplari_iptal(symbol)
+        sl = gercek * (1 - mesafe)
+        try:
+            _ll_stop_gonder(symbol, sl)
+        except Exception as e:
+            log.error(f"[LeadLONG] SL hatası {symbol}: {e} — pozisyon kapatılıyor")
+            lead_client.futures_create_order(symbol=symbol, side='SELL', type='MARKET', quantity=q,
+                                             positionSide='LONG')
+            with _ll_lock:
+                LEAD_LONG.pop(symbol, None)
+            tg(f"⚠️ LEAD LONG {symbol}: SL gönderilemedi, pozisyon kapatıldı")
+            return
+        with _ll_lock:
+            LEAD_LONG[symbol] = {'entry': gercek, 'e0': gercek, 'q': q, 'q0': q, 'sl': sl,
+                                 'en_yuksek_fiyat': gercek, 'piramit_ek': 0,
+                                 'acilis_zaman': int(time.time() * 1000)}
+        _ll_kaydet()
+        tg(f"🎯 LEAD LONG açıldı {symbol}\nGiriş:{gercek} SL(%{AYARLAR['PERCENT_TRAILING_MESAFE']}):"
+           f"{round(sl, precision_al(symbol)[0])}\nMiktar:{q} Kaldıraç:{LEAD_LONG_LEVERAGE}x "
+           f"Risk:%{LEAD_LONG_RISK_PERCENT:g}")
+    except Exception as e:
+        log.error(f"[LeadLONG] Açma hatası {symbol}: {e}")
+        with _ll_lock:
+            if LEAD_LONG.get(symbol, {}).get('_rezerve'):
+                LEAD_LONG.pop(symbol, None)
+
+
+def _ll_atlama(symbol, detay):
+    _ll_atlama_son['adet'] += 1
+    if time.time() - _ll_atlama_son['t'] < 21600:
+        return
+    tg(f"💸 COPY (Lead) LONG: bakiye yetersiz — giriş ATLANDI\n{symbol}: {detay}\n"
+       f"(son bildirimden beri {_ll_atlama_son['adet']} atlama; en fazla 6 saatte bir)")
+    _ll_atlama_son.update(t=time.time(), adet=0)
+
+
+def _ll_piramit(symbol, i, mark):
+    e0 = i.get('e0', i['entry'])
+    ek = i.get('piramit_ek', 0)
+    if (not PIRAMIT_AKTIF or ek >= PIRAMIT_MAX or bot_durduruldu or DEVRE_KESICI_TETIK
+            or mark < e0 * (1 + PIRAMIT_ADIM_YUZDE * (ek + 1) / 100)):
+        return
+    with _ll_lock:
+        LEAD_LONG[symbol]['piramit_ek'] = ek + 1      # önce işaretle: hata olsa da tekrar denemesin
+    b = _ll_bakiye() or 0
+    qa = i.get('q0', i['q']) * PIRAMIT_BOYUT
+    qa = min(qa, max((b * 0.20 * LEAD_LONG_LEVERAGE) / mark - i['q'], 0.0))
+    qa, min_n = _ll_miktar_yuvarla(symbol, qa, mark)
+    if qa <= 0 or qa * mark < min_n:
+        log.info(f"[LeadLONG] {symbol}: piramit miktarı yetersiz, atlandı")
+        _ll_kaydet()
+        return
+    order = lead_client.futures_create_order(symbol=symbol, side='BUY', type='MARKET', quantity=qa,
+                                             positionSide='LONG')
+    fill = float((order or {}).get('avgPrice') or 0) or mark
+    with _ll_lock:
+        p = LEAD_LONG[symbol]
+        yeni_q = p['q'] + qa
+        p['entry'] = (p['entry'] * p['q'] + fill * qa) / yeni_q
+        p['q'] = yeni_q
+    _ll_kaydet()
+    tg(f"➕ LEAD LONG PİRAMİT {symbol}\nİlk giriş {e0} → {qa} eklendi @ {fill} | toplam {yeni_q}")
+
+
+def lead_long_yonet():
+    """Her tarama turunda: kapananları temizle, sahipsizleri sahiplen, piramit + trailing."""
+    if not LEAD_LONG_AKTIF:
+        return
+    try:
+        pozlar = {p['symbol']: p for p in lead_client.futures_position_information()
+                  if p.get('positionSide') == 'LONG' and float(p.get('positionAmt', 0)) != 0}
+    except Exception as e:
+        log.error(f"[LeadLONG] Pozisyon sorgu hatası: {e}")
+        return
+    # 1) borsada kapanmış (stop dolmuş) pozisyonlar
+    with _ll_lock:
+        kapananlar = [s for s, i in LEAD_LONG.items() if s not in pozlar and not i.get('_rezerve')]
+    for s in kapananlar:
+        with _ll_lock:
+            i = LEAD_LONG.pop(s, {})
+            LEAD_LONG_SON_KAPANIS[s] = time.time()
+        _ll_stoplari_iptal(s)
+        kz = (i.get('sl', 0) - i.get('entry', 0)) * i.get('q', 0)
+        tg(f"{'💰' if kz >= 0 else '🔴'} LEAD LONG kapandı (stop) {s}\nGiriş:{i.get('entry')} "
+           f"Stop:{round(i.get('sl', 0), 6)}\nTahmini K/Z: {kz:+.2f} USDT")
+    if kapananlar:
+        _ll_kaydet()
+    # 2) sahipsiz pozisyonlar (hafıza kaybı): korumaya al, piramit YOK
+    for s, p in pozlar.items():
+        if s in LEAD_LONG:
+            continue
+        giris = float(p.get('entryPrice', 0))
+        if giris <= 0:
+            continue
+        mevcut = _ll_mevcut_stop(s)
+        sl = mevcut or giris * (1 - AYARLAR['PERCENT_TRAILING_MESAFE'] / 100)
+        if not mevcut:
+            try:
+                _ll_stop_gonder(s, sl)
+            except Exception as e:
+                log.error(f"[LeadLONG] {s}: sahipsiz pozisyona stop konamadı: {e}")
+        with _ll_lock:
+            LEAD_LONG[s] = {'entry': giris, 'e0': giris, 'q': abs(float(p['positionAmt'])),
+                            'q0': abs(float(p['positionAmt'])), 'sl': sl, 'en_yuksek_fiyat': giris,
+                            'piramit_ek': PIRAMIT_MAX, 'acilis_zaman': int(time.time() * 1000)}
+        _ll_kaydet()
+        tg(f"⚠️ LEAD LONG sahipsiz pozisyon devralındı: {s} (giriş {giris}, stop {round(sl, 6)})")
+    # 3) piramit + trailing
+    mesafe = AYARLAR['PERCENT_TRAILING_MESAFE'] / 100
+    for s, p in pozlar.items():
+        with _ll_lock:
+            i = dict(LEAD_LONG.get(s, {}))
+        if not i or i.get('_rezerve'):
+            continue
+        try:
+            mark = float(p['markPrice'])
+            _ll_piramit(s, i, mark)
+            with _ll_lock:
+                i = dict(LEAD_LONG.get(s, i))
+            e0 = i.get('e0', i['entry'])
+            en_yuksek = max(i.get('en_yuksek_fiyat', i['entry']), mark)
+            if en_yuksek <= i.get('en_yuksek_fiyat', i['entry']):
+                continue
+            yeni_sl = en_yuksek * (1 - mesafe) if TRAILING_MOD == 'ZIRVE' else en_yuksek - e0 * mesafe
+            if yeni_sl <= i.get('sl', 0):
+                with _ll_lock:
+                    if s in LEAD_LONG:
+                        LEAD_LONG[s]['en_yuksek_fiyat'] = en_yuksek
+                continue
+            _ll_stoplari_iptal(s)
+            time.sleep(0.3)
+            try:
+                _ll_stop_gonder(s, yeni_sl)
+                with _ll_lock:
+                    if s in LEAD_LONG:
+                        LEAD_LONG[s]['sl'] = yeni_sl
+                        LEAD_LONG[s]['en_yuksek_fiyat'] = en_yuksek
+                _ll_kaydet()
+            except Exception as e:
+                log.error(f"[LeadLONG] {s}: trailing SL gönderilemedi — pozisyon GEÇİCİ olarak SL'siz olabilir: {e}")
+                tg(f"⚠️ LEAD LONG {s}: trailing SL güncellenemedi — LÜTFEN KONTROL EDİN")
+        except Exception as e:
+            log.error(f"[LeadLONG] Yönetim hatası {s}: {e}")
+
+
+def lead_long_ozet():
+    if not LEAD_LONG_AKTIF:
+        return "🎯 Copy (Lead) LONG yansıtma: KAPALI (LEAD_API_KEY/SECRET yok veya LEAD_LONG_AKTIF=false)"
+    b = _ll_bakiye()
+    satir = [f"🎯 COPY (Lead) LONG — bakiye {b if b is None else round(b, 2)} USDT | risk %{LEAD_LONG_RISK_PERCENT:g} "
+             f"| {LEAD_LONG_LEVERAGE}x | açık {len(LEAD_LONG)}/{LEAD_LONG_MAX_OPEN}"]
+    for s, i in LEAD_LONG.items():
+        if i.get('_rezerve'):
+            continue
+        satir.append(f"{s} giriş:{round(i['entry'], 6)} SL:{round(i['sl'], 6)} ilk:{i.get('e0')} "
+                     f"ekleme:{i.get('piramit_ek', 0)}/{PIRAMIT_MAX}")
+    return "\n".join(satir)
+
+
 if __name__ == '__main__':
     try:
         ayarlar_yukle()
@@ -1794,5 +2118,7 @@ if __name__ == '__main__':
         devre_kesici_kontrol()
         log.info(devre_kesici_ozet())
         threading.Thread(target=devre_kesici_dongusu, daemon=True).start()
+    if LEAD_LONG_AKTIF:
+        _ll_yukle()
     threading.Thread(target=tarama_dongusu, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5001)), debug=False)
