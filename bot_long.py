@@ -56,6 +56,77 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── HATA BİLDİRİMİ (2026-09-26) ─────────────────────────────────────────────────
+# Sessiz arızaları yakalamak için: log.error / log.exception ile yazılan HER hata,
+# Telegram'a da iletilir (sadece loga gömülüp kaybolmasın). Ders: bot_long.py'de
+# 19 Eylül'den beri her LONG sinyali NameError ile düşüyor, 'except' onu yutup
+# sadece loga yazıyordu — bir haftadan uzun süre kimse fark etmedi.
+# Spam koruması: aynı TÜR hata (coin adları ve sayılar maskelenir) saatte en fazla
+# 1 kez; toplamda saatte en fazla HATA_BILDIRIM_MAX_SAAT mesaj. Bastırılan tekrar
+# sayısı bir sonraki mesajda belirtilir. Kapatmak için: HATA_BILDIRIM_AKTIF=false
+import re as _hb_re
+HATA_BILDIRIM_AKTIF = os.environ.get('HATA_BILDIRIM_AKTIF', 'true').lower() in ('1', 'true', 'evet', 'yes')
+HATA_BILDIRIM_ARALIK_SN = int(os.environ.get('HATA_BILDIRIM_ARALIK_SN', 3600))
+HATA_BILDIRIM_MAX_SAAT = int(os.environ.get('HATA_BILDIRIM_MAX_SAAT', 10))
+
+
+class _TelegramHataBildirici(logging.Handler):
+    def __init__(self, etiket):
+        super().__init__(level=logging.ERROR)
+        self.etiket = etiket
+        self._son = {}          # tür → son gönderim zamanı
+        self._bastirilan = {}   # tür → bastırılan tekrar sayısı
+        self._saat = []         # son 1 saatteki gönderim zamanları
+        self._kilit = threading.Lock()
+
+    @staticmethod
+    def _tur(mesaj):
+        m = _hb_re.sub(r'\b[A-Z0-9]{2,}USDT\b', 'SYM', mesaj)
+        m = _hb_re.sub(r'\d+(\.\d+)?', '#', m)
+        return m[:90]
+
+    def emit(self, record):
+        try:
+            mesaj = record.getMessage()
+            if 'Telegram hata' in mesaj or not HATA_BILDIRIM_AKTIF:
+                return   # sonsuz döngü koruması
+            tur = self._tur(mesaj)
+            simdi = time.time()
+            with self._kilit:
+                self._saat = [t for t in self._saat if simdi - t < 3600]
+                if (simdi - self._son.get(tur, 0) < HATA_BILDIRIM_ARALIK_SN
+                        or len(self._saat) >= HATA_BILDIRIM_MAX_SAAT):
+                    self._bastirilan[tur] = self._bastirilan.get(tur, 0) + 1
+                    return
+                self._son[tur] = simdi
+                self._saat.append(simdi)
+                tekrar = self._bastirilan.pop(tur, 0)
+            metin = f"⚠️ [{self.etiket}] BEKLENMEDİK HATA\n{mesaj[:700]}"
+            if record.exc_info:
+                metin += "\n" + self.format(record).splitlines()[-1][:300]
+            if tekrar:
+                metin += f"\n(bu tür hata son bildirimden beri {tekrar} kez daha oldu)"
+            metin += f"\n(aynı tür en fazla {HATA_BILDIRIM_ARALIK_SN // 60} dk'da bir bildirilir)"
+            threading.Thread(target=self._gonder, args=(metin,), daemon=True).start()
+        except Exception:
+            pass   # bildirici asla botu düşürmemeli
+
+    @staticmethod
+    def _gonder(metin):
+        token = os.environ.get('TELEGRAM_TOKEN', '')
+        chat = os.environ.get('TELEGRAM_CHAT_ID', '')
+        if not token or not chat:
+            return
+        try:
+            requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": metin}, timeout=10,
+                          proxies={"http": None, "https": None})
+        except Exception:
+            pass
+
+
+log.addHandler(_TelegramHataBildirici('LONG'))
+
 app = Flask(__name__)
 
 API_KEY          = os.environ.get('API_KEY', '')
