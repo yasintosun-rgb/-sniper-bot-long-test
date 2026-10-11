@@ -2046,7 +2046,7 @@ if __name__ == '__main__':
         for p in positions:
             if float(p['positionAmt']) != 0:
                 sym = p['symbol']
-                if sym in acik: continue
+                if sym in acik or sym == 'BNBUSDT': continue
                 try:
                     normal_orders = [o for o in client.futures_get_open_orders(symbol=sym)
                                      if o.get('positionSide') == POZISYON_YONU]
