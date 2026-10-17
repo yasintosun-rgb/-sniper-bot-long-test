@@ -1057,6 +1057,11 @@ def buy(symbol, fiyat):
         gunluk_net_kz_kopya = gunluk_net_kz
 
     try:
+        if symbol == 'BNBUSDT' and any(p.get('positionSide') == 'LONG' and float(p['positionAmt']) != 0
+                                       for p in client.futures_position_information(symbol='BNBUSDT')):
+            log.info("BNBUSDT sinyali atlandi: hesapta BNB_LONG (bot.py) pozisyonu var")
+            with lock: acik.pop(symbol, None)
+            return
         if gunluk_net_kz_kopya <= -bakiye() * AYARLAR['MAX_GUNLUK_ZARAR'] / 100:
             log.info(f"{symbol} sinyali atlandi: MAX_GUNLUK_ZARAR limiti doldu")
             with lock: acik.pop(symbol, None)
