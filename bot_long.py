@@ -654,6 +654,91 @@ def _btc_volatilite_carpani():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# CANLILIK İZLEME (2026-10-19)
+# ════════════════════════════════════════════════════════════════════════════════
+# Her döngü her turun başında kalp(ad, limit_sn) çağırır. Bir döngü limit_sn'den
+# uzun süre kalp atmazsa (takıldı / thread öldü) bekçi Telegram'a uyarı gönderir,
+# döngü düzelince "düzeldi" mesajı gelir. Günlük rapor bunu yakalayamaz: thread'ler
+# bağımsız, biri takılınca diğerleri (rapor dahil) çalışmaya devam eder.
+# Süreç TAMAMEN ölürse kendi ölümünü bildiremez — bunun için /canlilik adresi
+# gecikme varsa 503 döner; UptimeRobot bu adrese bakarak haber verir.
+# (/health bilerek hep 200 kalır: Render health check'i ona bağlıysa servisi
+# gereksiz yere yeniden başlatmasın.)
+CANLILIK_AKTIF = os.environ.get('CANLILIK_AKTIF', 'true').lower() in ('1', 'true', 'evet', 'yes')
+CANLILIK_KONTROL_SN = int(os.environ.get('CANLILIK_KONTROL_SN', 60))
+CANLILIK_HATIRLATMA_SAAT = float(os.environ.get('CANLILIK_HATIRLATMA_SAAT', 6))
+_kalpler = {}   # ad -> {'t': son kalp, 'limit': sn, 'alarm_t': 0 = alarm yok}
+_kalp_lock = threading.Lock()
+
+
+def _sure_metni(sn):
+    sn = int(sn)
+    if sn >= 3600:
+        return f"{sn // 3600} sa {(sn % 3600) // 60} dk"
+    return f"{sn // 60} dk {sn % 60} sn" if sn >= 60 else f"{sn} sn"
+
+
+def kalp(ad, limit_sn):
+    """Döngü 'ad' hâlâ çalışıyor. limit_sn içinde tekrar çağrılmazsa alarm."""
+    duzeldi = None
+    with _kalp_lock:
+        k = _kalpler.get(ad)
+        simdi = time.time()
+        if k and k['alarm_t']:
+            duzeldi = simdi - k['t']
+        _kalpler[ad] = {'t': simdi, 'limit': limit_sn, 'alarm_t': 0}
+    if duzeldi is not None:
+        tg(f"🟢 CANLILIK: '{ad}' döngüsü yeniden çalışıyor ({_sure_metni(duzeldi)} sessiz kaldı).")
+
+
+def canlilik_gecikenler():
+    simdi = time.time()
+    with _kalp_lock:
+        return [(ad, simdi - k['t'], k['limit']) for ad, k in _kalpler.items()
+                if simdi - k['t'] > k['limit']]
+
+
+def canlilik_ozet():
+    simdi = time.time()
+    with _kalp_lock:
+        satirlar = [f"{'🔴' if simdi - k['t'] > k['limit'] else '🟢'} {ad}: son tur "
+                    f"{_sure_metni(simdi - k['t'])} önce (sınır {_sure_metni(k['limit'])})"
+                    for ad, k in sorted(_kalpler.items())]
+    return "💓 Canlılık\n" + ("\n".join(satirlar) if satirlar else "henüz kayıtlı döngü yok")
+
+
+def canlilik_dongusu():
+    while True:
+        kalp('bekci', 10 * max(60, CANLILIK_KONTROL_SN))
+        try:
+            simdi = time.time()
+            for ad, gecen, limit in canlilik_gecikenler():
+                with _kalp_lock:
+                    k = _kalpler[ad]
+                    if k['alarm_t'] and simdi - k['alarm_t'] < CANLILIK_HATIRLATMA_SAAT * 3600:
+                        continue
+                    ilk = not k['alarm_t']
+                    k['alarm_t'] = simdi
+                log.error(f"[Canlılık] '{ad}' {gecen:.0f} sn'dir kalp atmadı (sınır {limit} sn)")
+                tg(f"🚨 CANLILIK {'ALARMI' if ilk else 'HATIRLATMA'}: '{ad}' döngüsü "
+                   f"{_sure_metni(gecen)}'dir çalışmıyor (sınır {_sure_metni(limit)}).\n"
+                   f"Takılmış ya da durmuş olabilir — Render loglarına bakın, gerekirse servisi "
+                   f"yeniden başlatın. Durum: /canlilik")
+        except Exception as e:
+            log.error(f"[Canlılık] bekçi hatası: {e}")
+        time.sleep(max(60, CANLILIK_KONTROL_SN))
+
+
+@app.route('/canlilik')
+def canlilik_saglik():
+    """UptimeRobot için: bir döngü gecikmişse 503 (süreç ölmüşse zaten cevap yok)."""
+    gec = canlilik_gecikenler()
+    if gec:
+        return "GECIKME: " + ", ".join(ad for ad, _, _ in gec), 503
+    return "OK", 200
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # HESAP GENELİ DEVRE KESİCİ (2026-09-25)
 # ════════════════════════════════════════════════════════════════════════════════
 # Aynı Binance hesabını birden fazla strateji paylaşıyor (bu süreçte LONG; ana
@@ -858,6 +943,7 @@ def devre_kesici_ozet():
 
 def devre_kesici_dongusu():
     while True:
+        kalp('devre_kesici', 30 * 60)
         devre_kesici_kontrol()
         time.sleep(max(60, DEVRE_KESICI_KONTROL_SN))
 
@@ -1535,6 +1621,7 @@ def tarama_dongusu():
        f"Copy (Lead) LONG yansıtma: {'AÇIK (risk %' + format(LEAD_LONG_RISK_PERCENT, 'g') + ', ' + str(LEAD_LONG_LEVERAGE) + 'x)' if LEAD_LONG_AKTIF else 'KAPALI'}"
        f"{_test_uyarisi}")
     while True:
+        kalp('long_tarama', 30 * 60)
         log.info("Yeni dongu iterasyonu basliyor...")
         try:
             bugun = datetime.now().date()
@@ -1603,6 +1690,8 @@ def telegram_komut():
                f"Günlük NET K/Z:{round(gunluk_net_kz,2)} USDT\n"+devre_kesici_ozet())
         elif cmd == '/devre':
             tg(devre_kesici_ozet())
+        elif cmd == '/canlilik':
+            tg(canlilik_ozet())
         elif cmd == '/copy':
             tg(lead_long_ozet())
         elif cmd.startswith('/devre_sifirla'):
@@ -2176,5 +2265,7 @@ if __name__ == '__main__':
         threading.Thread(target=devre_kesici_dongusu, daemon=True).start()
     if LEAD_LONG_AKTIF:
         _ll_yukle()
+    if CANLILIK_AKTIF:
+        threading.Thread(target=canlilik_dongusu, daemon=True).start()
     threading.Thread(target=tarama_dongusu, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5001)), debug=False)
