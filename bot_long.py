@@ -689,8 +689,8 @@ _DK_PERFORMANS_TIPLERI = {'REALIZED_PNL', 'COMMISSION', 'FUNDING_FEE', 'INSURANC
                           'DELIVERED_SETTELMENT', 'AUTO_EXCHANGE'}
 
 
-def _dk_env_sifirlama_ms():
-    ham = os.environ.get('DEVRE_KESICI_SIFIRLAMA', '').strip()
+def _dk_env_sifirlama_ms(ad='DEVRE_KESICI_SIFIRLAMA'):
+    ham = os.environ.get(ad, '').strip()
     if not ham:
         return 0
     try:
@@ -699,45 +699,67 @@ def _dk_env_sifirlama_ms():
             dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
     except Exception:
-        log.error(f"[DevreKesici] DEVRE_KESICI_SIFIRLAMA okunamadı: {ham!r} (örnek: 2026-09-25T12:00)")
+        log.error(f"[DevreKesici] {ad} okunamadı: {ham!r} (örnek: 2026-09-25T12:00)")
         return 0
 
 
-DEVRE_KESICI_TETIK = False
-_dk_durum = {'gelirler': {}, 'son_ms': 0, 'sifirlama_ms': _dk_env_sifirlama_ms(),
-             'tetik_ms': 0, 'son': None, 'hata_sayisi': 0}
+# FIX (2026-10-19): kesici eskiden SADECE ana hesaba (~21 USDT) bakıyordu ve
+# tetiklenince copy hesabını da durduruyordu — sermayenin neredeyse tamamının
+# durduğu copy (Lead) hesabının düşüşü hiç izlenmiyordu. Artık HESAP BAŞINA
+# ayrı kesici var: ANA hesabın düşüşü sadece ana hesaba emir açan girişleri,
+# COPY hesabının düşüşü sadece copy hesabına emir açan girişleri durdurur.
+# Eşik/pencere/süre ayarları ikisinde ortak. Copy için restart'a dayanıklı
+# elle sıfırlama: LEAD_DEVRE_KESICI_SIFIRLAMA env var.
+DEVRE_KESICI_TETIK = False        # ANA hesap
+LEAD_DEVRE_KESICI_TETIK = False   # COPY (Lead) hesabı
+
+
+def _dk_yeni_durum(sifirlama_ms):
+    return {'gelirler': {}, 'son_ms': 0, 'sifirlama_ms': sifirlama_ms, 'tetik': False,
+            'tetik_ms': 0, 'son': None, 'hata_sayisi': 0}
+
+
+_dk_hesaplar = {'ANA': _dk_yeni_durum(_dk_env_sifirlama_ms('DEVRE_KESICI_SIFIRLAMA')),
+                'COPY': _dk_yeni_durum(_dk_env_sifirlama_ms('LEAD_DEVRE_KESICI_SIFIRLAMA'))}
+_dk_durum = _dk_hesaplar['ANA']   # geriye uyum (panel vb. ana hesabı okur)
 _dk_lock = threading.Lock()
 
 
-def _dk_gelirleri_guncelle(simdi_ms):
+def _dk_client(hesap):
+    """ANA → client; COPY → lead_client (tanımlı değilse/kapalıysa None)."""
+    return client if hesap == 'ANA' else globals().get('lead_client')
+
+
+def _dk_gelirleri_guncelle(d, cl, simdi_ms):
     """Gelir geçmişini artımlı çeker (ilk seferde pencere kadar geriye)."""
     pencere_bas = simdi_ms - DEVRE_KESICI_PENCERE_GUN * 86_400_000
     # 10 dk örtüşme: Binance bazı gelir kayıtlarını gecikmeli yayınlar; kayıtlar
     # anahtarla tekilleştirildiği için çift sayılmaz.
-    bas = max(_dk_durum['son_ms'] - 600_000, pencere_bas)
+    bas = max(d['son_ms'] - 600_000, pencere_bas)
     for _ in range(50):  # sayfalama güvenlik sınırı
-        parca = client.futures_income_history(startTime=bas, endTime=simdi_ms, limit=1000)
+        parca = cl.futures_income_history(startTime=bas, endTime=simdi_ms, limit=1000)
         for g in parca:
             anahtar = (g.get('tranId'), g.get('incomeType'), g.get('symbol'), g.get('time'))
-            _dk_durum['gelirler'][anahtar] = (int(g['time']), g.get('incomeType'), float(g['income']))
+            d['gelirler'][anahtar] = (int(g['time']), g.get('incomeType'), float(g['income']))
         if len(parca) < 1000:
             break
         bas = int(parca[-1]['time']) + 1
-    _dk_durum['son_ms'] = simdi_ms
+    d['son_ms'] = simdi_ms
     # pencere dışına düşenleri at (bellek)
-    for k in [k for k, v in _dk_durum['gelirler'].items() if v[0] < pencere_bas]:
-        del _dk_durum['gelirler'][k]
+    for k in [k for k, v in d['gelirler'].items() if v[0] < pencere_bas]:
+        del d['gelirler'][k]
 
 
-def devre_kesici_hesapla():
+def devre_kesici_hesapla(hesap='ANA'):
     """Döner: {'ozkaynak','tepe','dd'} ya da None (hata)."""
+    d, cl = _dk_hesaplar[hesap], _dk_client(hesap)
     simdi_ms = int(time.time() * 1000)
-    hesap = client.futures_account()
-    cuzdan = float(hesap['totalWalletBalance'])
-    ozkaynak = cuzdan + float(hesap['totalUnrealizedProfit'])
-    _dk_gelirleri_guncelle(simdi_ms)
-    pencere_bas = max(simdi_ms - DEVRE_KESICI_PENCERE_GUN * 86_400_000, _dk_durum['sifirlama_ms'])
-    olaylar = sorted((t, tutar) for t, tip, tutar in _dk_durum['gelirler'].values()
+    h = cl.futures_account()
+    cuzdan = float(h['totalWalletBalance'])
+    ozkaynak = cuzdan + float(h['totalUnrealizedProfit'])
+    _dk_gelirleri_guncelle(d, cl, simdi_ms)
+    pencere_bas = max(simdi_ms - DEVRE_KESICI_PENCERE_GUN * 86_400_000, d['sifirlama_ms'])
+    olaylar = sorted((t, tutar) for t, tip, tutar in d['gelirler'].values()
                      if tip in _DK_PERFORMANS_TIPLERI and t >= pencere_bas)
     # Geriye doğru: her olaydan hemen sonraki "performans cüzdanı"
     toplam_sonra = sum(t for _, t in olaylar)
@@ -750,61 +772,88 @@ def devre_kesici_hesapla():
     return {'ozkaynak': ozkaynak, 'tepe': tepe, 'dd': max(dd, 0.0)}
 
 
+def _dk_hesap_kontrol(hesap):
+    d = _dk_hesaplar[hesap]
+    try:
+        s = devre_kesici_hesapla(hesap)
+        d['hata_sayisi'] = 0
+    except Exception as e:
+        d['hata_sayisi'] += 1
+        log.error(f"[DevreKesici] {hesap} hesaplama hatası ({d['hata_sayisi']}): {e}")
+        if d['hata_sayisi'] == 6:
+            tg(f"⚠️ [DevreKesici] {hesap} hesabı 6 kez üst üste hesaplanamadı — son durum korunuyor "
+               f"({'TETİKLİ' if d['tetik'] else 'normal'}). Hata: {e}")
+        return
+    d['son'] = s
+    simdi_ms = int(time.time() * 1000)
+    if not d['tetik'] and s['dd'] >= DEVRE_KESICI_DD_YUZDE:
+        d['tetik'] = True
+        d['tetik_ms'] = simdi_ms
+        log.error(f"[DevreKesici] {hesap} TETİKLENDİ: düşüş %{s['dd']:.2f} >= %{DEVRE_KESICI_DD_YUZDE}")
+        tg(f"🛑 {hesap} HESABI DEVRE KESİCİSİ TETİKLENDİ\n"
+           f"Özkaynak {s['ozkaynak']:.2f} USDT, son {DEVRE_KESICI_PENCERE_GUN} günün tepesi "
+           f"{s['tepe']:.2f} USDT → düşüş %{s['dd']:.2f} (eşik %{DEVRE_KESICI_DD_YUZDE:.0f})\n"
+           f"Bu serviste {hesap} hesabına yeni giriş DURDU (diğer hesap etkilenmez). Açık "
+           f"pozisyonlar borsadaki stoplarıyla korunmaya devam ediyor.\n"
+           f"En erken otomatik açılma: {DEVRE_KESICI_MIN_DURUS_SAAT:.0f} saat sonra (düşüş eşiğin "
+           f"altına inerse). Elle: /devre_sifirla {hesap.lower()}")
+    elif d['tetik'] and s['dd'] < DEVRE_KESICI_DD_YUZDE:
+        gecen_saat = (simdi_ms - d['tetik_ms']) / 3_600_000
+        if gecen_saat >= DEVRE_KESICI_MIN_DURUS_SAAT:
+            d['tetik'] = False
+            tg(f"🟢 {hesap} hesabı devre kesicisi kendiliğinden AÇILDI (düşüş %{s['dd']:.2f} < "
+               f"%{DEVRE_KESICI_DD_YUZDE:.0f}, {gecen_saat:.0f} saattir kapalıydı). Yeni girişler serbest.")
+
+
 def devre_kesici_kontrol():
-    global DEVRE_KESICI_TETIK
+    global DEVRE_KESICI_TETIK, LEAD_DEVRE_KESICI_TETIK
     if not DEVRE_KESICI_AKTIF:
         return
     with _dk_lock:
-        try:
-            s = devre_kesici_hesapla()
-            _dk_durum['hata_sayisi'] = 0
-        except Exception as e:
-            _dk_durum['hata_sayisi'] += 1
-            log.error(f"[DevreKesici] hesaplama hatası ({_dk_durum['hata_sayisi']}): {e}")
-            if _dk_durum['hata_sayisi'] == 6:
-                tg(f"⚠️ [DevreKesici] 6 kez üst üste hesaplanamadı — son durum korunuyor "
-                   f"({'TETİKLİ' if DEVRE_KESICI_TETIK else 'normal'}). Hata: {e}")
-            return
-        _dk_durum['son'] = s
-        simdi_ms = int(time.time() * 1000)
-        if not DEVRE_KESICI_TETIK and s['dd'] >= DEVRE_KESICI_DD_YUZDE:
-            DEVRE_KESICI_TETIK = True
-            _dk_durum['tetik_ms'] = simdi_ms
-            log.error(f"[DevreKesici] TETİKLENDİ: düşüş %{s['dd']:.2f} >= %{DEVRE_KESICI_DD_YUZDE}")
-            tg(f"🛑 HESAP DEVRE KESİCİSİ TETİKLENDİ\n"
-               f"Özkaynak {s['ozkaynak']:.2f} USDT, son {DEVRE_KESICI_PENCERE_GUN} günün tepesi "
-               f"{s['tepe']:.2f} USDT → düşüş %{s['dd']:.2f} (eşik %{DEVRE_KESICI_DD_YUZDE:.0f})\n"
-               f"Bu serviste TÜM stratejilerde yeni giriş DURDU. Açık pozisyonlar borsadaki "
-               f"stoplarıyla korunmaya devam ediyor.\n"
-               f"En erken otomatik açılma: {DEVRE_KESICI_MIN_DURUS_SAAT:.0f} saat sonra (düşüş eşiğin "
-               f"altına inerse). Elle: /devre_sifirla")
-        elif DEVRE_KESICI_TETIK and s['dd'] < DEVRE_KESICI_DD_YUZDE:
-            gecen_saat = (simdi_ms - _dk_durum['tetik_ms']) / 3_600_000
-            if gecen_saat >= DEVRE_KESICI_MIN_DURUS_SAAT:
-                DEVRE_KESICI_TETIK = False
-                tg(f"🟢 Hesap devre kesicisi kendiliğinden AÇILDI (düşüş %{s['dd']:.2f} < "
-                   f"%{DEVRE_KESICI_DD_YUZDE:.0f}, {gecen_saat:.0f} saattir kapalıydı). Yeni girişler serbest.")
+        for hesap in _dk_hesaplar:
+            if _dk_client(hesap) is not None:
+                _dk_hesap_kontrol(hesap)
+        DEVRE_KESICI_TETIK = _dk_hesaplar['ANA']['tetik']
+        LEAD_DEVRE_KESICI_TETIK = _dk_hesaplar['COPY']['tetik']
 
 
-def devre_kesici_sifirla():
-    """Elle sıfırlama: tepe referansı şimdiye çekilir, kesici açılır."""
-    global DEVRE_KESICI_TETIK
+def devre_kesici_sifirla(hesap=None):
+    """Elle sıfırlama: tepe referansı şimdiye çekilir, kesici açılır.
+    hesap=None → iki hesap da; 'ANA' / 'COPY' → sadece o hesap."""
+    global DEVRE_KESICI_TETIK, LEAD_DEVRE_KESICI_TETIK
     with _dk_lock:
-        _dk_durum['sifirlama_ms'] = int(time.time() * 1000)
-        DEVRE_KESICI_TETIK = False
+        for h in ([hesap] if hesap else list(_dk_hesaplar)):
+            _dk_hesaplar[h]['sifirlama_ms'] = int(time.time() * 1000)
+            _dk_hesaplar[h]['tetik'] = False
+        DEVRE_KESICI_TETIK = _dk_hesaplar['ANA']['tetik']
+        LEAD_DEVRE_KESICI_TETIK = _dk_hesaplar['COPY']['tetik']
     devre_kesici_kontrol()
+
+
+def _dk_sifirla_komut(cmd):
+    """'/devre_sifirla' → iki hesap; '/devre_sifirla ana|copy' → tek hesap."""
+    arg = cmd.split()[1] if len(cmd.split()) > 1 else ''
+    hesap = {'ana': 'ANA', 'copy': 'COPY', 'lead': 'COPY'}.get(arg)
+    devre_kesici_sifirla(hesap)
+    return hesap or 'ANA + COPY'
 
 
 def devre_kesici_ozet():
     if not DEVRE_KESICI_AKTIF:
         return "🛡️ Hesap devre kesicisi: kapalı (DEVRE_KESICI_AKTIF=false)"
-    s = _dk_durum['son']
-    durum = '🔴 TETİKLİ (yeni giriş yok)' if DEVRE_KESICI_TETIK else '🟢 normal'
-    if s is None:
-        return f"🛡️ Hesap devre kesicisi: {durum} — henüz hesaplanmadı"
-    return (f"🛡️ Hesap devre kesicisi: {durum}\n"
-            f"   Özkaynak {s['ozkaynak']:.2f} / tepe {s['tepe']:.2f} USDT → düşüş %{s['dd']:.2f} "
-            f"(eşik %{DEVRE_KESICI_DD_YUZDE:.0f}, pencere {DEVRE_KESICI_PENCERE_GUN} gün)")
+    satirlar = [f"🛡️ Hesap devre kesicileri (eşik %{DEVRE_KESICI_DD_YUZDE:.0f}, "
+                f"pencere {DEVRE_KESICI_PENCERE_GUN} gün):"]
+    for hesap, d in _dk_hesaplar.items():
+        if _dk_client(hesap) is None:
+            continue
+        durum = '🔴 TETİKLİ (bu hesaba yeni giriş yok)' if d['tetik'] else '🟢 normal'
+        s = d['son']
+        if s is None:
+            satirlar.append(f"   {hesap}: {durum} — henüz hesaplanmadı")
+        else:
+            satirlar.append(f"   {hesap}: {durum} — özkaynak {s['ozkaynak']:.2f} / tepe {s['tepe']:.2f} "
+                            f"USDT → düşüş %{s['dd']:.2f}")
+    return "\n".join(satirlar)
 
 
 def devre_kesici_dongusu():
@@ -1556,10 +1605,12 @@ def telegram_komut():
             tg(devre_kesici_ozet())
         elif cmd == '/copy':
             tg(lead_long_ozet())
-        elif cmd == '/devre_sifirla':
-            devre_kesici_sifirla()
-            tg("🟢 Hesap devre kesicisi elle SIFIRLANDI (LONG) — tepe referansı şimdiye çekildi.\n"+devre_kesici_ozet()+
-               "\n(Not: SHORT servisinde de ayrıca /devre_sifirla gönderin; restart sonrası kalıcılık için DEVRE_KESICI_SIFIRLAMA env var.)")
+        elif cmd.startswith('/devre_sifirla'):
+            hesap = _dk_sifirla_komut(cmd)
+            tg(f"🟢 Devre kesicisi elle SIFIRLANDI (LONG, {hesap}) — tepe referansı şimdiye çekildi.\n"+devre_kesici_ozet()+
+               "\n(Tek hesap için: /devre_sifirla ana | /devre_sifirla copy. Not: SHORT servisinde de ayrıca "
+               "/devre_sifirla gönderin; restart sonrası kalıcılık için DEVRE_KESICI_SIFIRLAMA / "
+               "LEAD_DEVRE_KESICI_SIFIRLAMA env var.)")
         elif cmd == '/bakiye':
             tg(f"💰 Bakiye: {round(bakiye(),2)} USDT")
         elif cmd == '/acik':
@@ -1840,7 +1891,7 @@ def _ll_mevcut_stop(symbol):
 
 def lead_long_ac(symbol, fiyat):
     """Ana hesaptan BAĞIMSIZ: copy hesabında LONG aç (kendi bakiyesine göre)."""
-    if not LEAD_LONG_AKTIF or bot_durduruldu or DEVRE_KESICI_TETIK:
+    if not LEAD_LONG_AKTIF or bot_durduruldu or LEAD_DEVRE_KESICI_TETIK:
         return
     with _ll_lock:
         if symbol in LEAD_LONG or len(LEAD_LONG) >= LEAD_LONG_MAX_OPEN:
@@ -1916,7 +1967,7 @@ def _ll_atlama(symbol, detay):
 def _ll_piramit(symbol, i, mark):
     e0 = i.get('e0', i['entry'])
     ek = i.get('piramit_ek', 0)
-    if (not PIRAMIT_AKTIF or ek >= PIRAMIT_MAX or bot_durduruldu or DEVRE_KESICI_TETIK
+    if (not PIRAMIT_AKTIF or ek >= PIRAMIT_MAX or bot_durduruldu or LEAD_DEVRE_KESICI_TETIK
             or mark < e0 * (1 + PIRAMIT_ADIM_YUZDE * (ek + 1) / 100)):
         return
     with _ll_lock:
